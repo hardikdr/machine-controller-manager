@@ -76,13 +76,17 @@ func (d *AWSDriver) Create() (string, string, error) {
 
 	var blkDeviceMappings []*ec2.BlockDeviceMapping
 	deviceName := output.Images[0].RootDeviceName
-	volumeSize := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeSize
+	//volumeSize := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeSize
 	volumeType := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeType
+	snapID := "snap-0da880f8cf1764146"
+	deleteOnTermination := true
 	blkDeviceMapping := ec2.BlockDeviceMapping{
 		DeviceName: deviceName,
 		Ebs: &ec2.EbsBlockDevice{
-			VolumeSize: &volumeSize,
-			VolumeType: &volumeType,
+			// VolumeSize: &volumeSize,
+			// VolumeType: &volumeType,
+			SnapshotId:          &snapID,
+			DeleteOnTermination: &deleteOnTermination,
 		},
 	}
 	if volumeType == "io1" {
