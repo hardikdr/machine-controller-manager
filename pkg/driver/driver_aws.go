@@ -76,12 +76,16 @@ func (d *AWSDriver) Create() (string, string, error) {
 
 	var blkDeviceMappings []*ec2.BlockDeviceMapping
 	deviceName := output.Images[0].RootDeviceName
-	//volumeSize := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeSize
+	volumeSize := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeSize
 	volumeType := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeType
-	snapID := "snap-0da880f8cf1764146"
+	snapID := "snap-08d5566223eb85057" //Snapshot of jeos  snap-0e1a4a4794ff1ec52
+	// "snap-07c1b20113112fc3e"[snap of the coreos ami]
+	deviceNameScaleMP := "/dev/sdb"
+	//"snap-0da880f8cf1764146"
 	deleteOnTermination := true
+	// For scalemp disk
 	blkDeviceMapping := ec2.BlockDeviceMapping{
-		DeviceName: deviceName,
+		DeviceName: &deviceNameScaleMP,
 		Ebs: &ec2.EbsBlockDevice{
 			// VolumeSize: &volumeSize,
 			// VolumeType: &volumeType,
@@ -93,6 +97,19 @@ func (d *AWSDriver) Create() (string, string, error) {
 		blkDeviceMapping.Ebs.Iops = &d.AWSMachineClass.Spec.BlockDevices[0].Ebs.Iops
 	}
 	blkDeviceMappings = append(blkDeviceMappings, &blkDeviceMapping)
+
+	//For root disk
+	blkDeviceMapping2 := ec2.BlockDeviceMapping{
+		DeviceName: deviceName,
+		Ebs: &ec2.EbsBlockDevice{
+			VolumeSize: &volumeSize,
+			VolumeType: &volumeType,
+			// SnapshotId:          &snapID,
+			DeleteOnTermination: &deleteOnTermination,
+		},
+	}
+	//It should now have 2 blockdevices attached
+	blkDeviceMappings = append(blkDeviceMappings, &blkDeviceMapping2)
 
 	// Add tags to the created machine
 	tagList := []*ec2.Tag{}
