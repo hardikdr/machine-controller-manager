@@ -78,8 +78,9 @@ func (d *AWSDriver) Create() (string, string, error) {
 	deviceName := output.Images[0].RootDeviceName
 	volumeSize := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeSize
 	volumeType := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeType
-	snapID := "snap-08d5566223eb85057" //Snapshot of jeos  snap-0e1a4a4794ff1ec52
-	// "snap-07c1b20113112fc3e"[snap of the coreos ami]
+	snapID := "snap-08d5566223eb85057" //Snapshot of jeos snap-0e1a4a4794ff1ec52
+	// "snap-07c1b20113112fc3e"[snap of the coreos ami] , snap-0831164c874e7602d
+	// new jeos from the cluster snap-0831164c874e7602d
 	deviceNameScaleMP := "/dev/sdb"
 	//"snap-0da880f8cf1764146"
 	deleteOnTermination := true
@@ -87,7 +88,7 @@ func (d *AWSDriver) Create() (string, string, error) {
 	blkDeviceMapping := ec2.BlockDeviceMapping{
 		DeviceName: &deviceNameScaleMP,
 		Ebs: &ec2.EbsBlockDevice{
-			// VolumeSize: &volumeSize,
+			VolumeSize: &volumeSize,
 			// VolumeType: &volumeType,
 			SnapshotId:          &snapID,
 			DeleteOnTermination: &deleteOnTermination,
