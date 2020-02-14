@@ -264,6 +264,7 @@ func (c *controller) validateMachineClass(classSpec *v1alpha1.ClassSpec) (interf
 }
 
 // nodeConditionsHaveChanged compares two node statuses to see if any of the statuses have changed
+// TODO: This should return true only if the actual condition changed and not only the updateTime of each condition.
 func nodeConditionsHaveChanged(machineConditions []v1.NodeCondition, nodeConditions []v1.NodeCondition) bool {
 
 	if len(machineConditions) != len(nodeConditions) {

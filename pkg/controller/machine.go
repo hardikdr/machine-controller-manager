@@ -267,13 +267,13 @@ func (c *controller) getMachineFromNode(nodeName string) (*v1alpha1.Machine, err
 
 func (c *controller) updateMachineState(machine *v1alpha1.Machine) (*v1alpha1.Machine, error) {
 
-	if machine.Status.Node == "" {
+	if machine.Labels["node"] == "" {
 		// There are no objects mapped to this machine object
 		// Hence node status need not be propogated to machine object
 		return machine, nil
 	}
 
-	node, err := c.nodeLister.Get(machine.Status.Node)
+	node, err := c.nodeLister.Get(machine.Labels["node"])
 	if err != nil && apierrors.IsNotFound(err) {
 		// Node object is not found
 
@@ -500,7 +500,7 @@ func (c *controller) machineUpdate(machine *v1alpha1.Machine, actualProviderID s
 
 func (c *controller) machineDelete(machine *v1alpha1.Machine, driver driver.Driver) error {
 	var err error
-	nodeName := machine.Status.Node
+	nodeName := machine.Labels["node"]
 
 	if finalizers := sets.NewString(machine.Finalizers...); finalizers.Has(DeleteFinalizerName) {
 		klog.V(2).Infof("Deleting Machine %q", machine.Name)
@@ -688,6 +688,7 @@ func (c *controller) updateMachineStatus(
 	clone = clone.DeepCopy()
 	clone.Status.LastOperation = lastOperation
 	clone.Status.CurrentStatus = currentStatus
+	clone.Status.Node = machine.Labels["node"]
 
 	clone, err = c.controlMachineClient.Machines(clone.Namespace).UpdateStatus(clone)
 	if err != nil {
