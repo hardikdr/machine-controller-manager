@@ -4,7 +4,7 @@ FROM golang:1.13.5 AS builder
 WORKDIR /go/src/github.com/gardener/machine-controller-manager
 COPY . .
 
-RUN .ci/build
+#RUN .ci/build
 
 #############      base                                     #############
 FROM alpine:3.11.2 as base

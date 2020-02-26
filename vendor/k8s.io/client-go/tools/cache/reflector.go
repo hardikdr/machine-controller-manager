@@ -199,23 +199,28 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			return fmt.Errorf("%s: Failed to list %v: %v", r.name, r.expectedType, err)
 		}
 		initTrace.Step("Objects listed")
+		klog.V(3).Infof("[HR] Objects listed %v", r.name, r.expectedType)
 		listMetaInterface, err := meta.ListAccessor(list)
 		if err != nil {
 			return fmt.Errorf("%s: Unable to understand list result %#v: %v", r.name, list, err)
 		}
 		resourceVersion = listMetaInterface.GetResourceVersion()
 		initTrace.Step("Resource version extracted")
+		klog.V(3).Infof("[HR] Resource version extracted %v", resourceVersion)
 		items, err := meta.ExtractList(list)
 		if err != nil {
 			return fmt.Errorf("%s: Unable to understand list result %#v (%v)", r.name, list, err)
 		}
 		initTrace.Step("Objects extracted")
+		klog.V(3).Infof("[HR] Objects extracted")
 		if err := r.syncWith(items, resourceVersion); err != nil {
 			return fmt.Errorf("%s: Unable to sync list result: %v", r.name, err)
 		}
 		initTrace.Step("SyncWith done")
+		klog.V(3).Infof("[HR] SyncWith done")
 		r.setLastSyncResourceVersion(resourceVersion)
 		initTrace.Step("Resource version updated")
+		klog.V(3).Infof("[HR] Resource version updated")
 		return nil
 	}(); err != nil {
 		return err
@@ -246,6 +251,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			}
 			cleanup()
 			resyncCh, cleanup = r.resyncChan()
+			klog.V(3).Infof("[HR] Getting the resync channel")
 		}
 	}()
 
@@ -258,6 +264,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		}
 
 		timeoutSeconds := int64(minWatchTimeout.Seconds() * (rand.Float64() + 1.0))
+		klog.V(3).Infof("[HR] Timeout seconds: %v", timeoutSeconds)
 		options = metav1.ListOptions{
 			ResourceVersion: resourceVersion,
 			// We want to avoid situations of hanging watchers. Stop any wachers that do not
@@ -271,6 +278,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 
 		w, err := r.listerWatcher.Watch(options)
 		if err != nil {
+			klog.V(3).Infof("[HR] Error watching : %v", err)
 			switch err {
 			case io.EOF:
 				// watch closed normally
@@ -284,13 +292,16 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			// watch where we ended.
 			// If that's the case wait and resend watch request.
 			if utilnet.IsConnectionRefused(err) {
+				klog.V(3).Infof("[HR] Connection is refused from APIServer")
 				time.Sleep(time.Second)
 				continue
 			}
+			klog.V(3).Infof("[HR] Watch failed returning nil")
 			return nil
 		}
 
 		if err := r.watchHandler(w, &resourceVersion, resyncerrc, stopCh); err != nil {
+			klog.V(3).Infof("[HR] WatchHandler failed with error %v", err)
 			if err != errorStopRequested {
 				switch {
 				case apierrs.IsResourceExpired(err):
@@ -299,6 +310,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 					klog.Warningf("%s: watch of %v ended with: %v", r.name, r.expectedType, err)
 				}
 			}
+			klog.V(3).Infof("[HR] WatchHandler failed returning nil")
 			return nil
 		}
 	}
@@ -326,16 +338,20 @@ loop:
 	for {
 		select {
 		case <-stopCh:
+			klog.V(3).Infof("[HR] WatchHandlerLog: Stop requested.")
 			return errorStopRequested
 		case err := <-errc:
+			klog.V(3).Infof("[HR] WatchHandlerLog: Error occured: %v", err)
 			return err
 		case event, ok := <-w.ResultChan():
 			if !ok {
+				klog.V(3).Infof("[HR] WatchHandlerLog: ok is false")
 				break loop
 			}
 			if event.Type == watch.Error {
 				return apierrs.FromObject(event.Object)
 			}
+			klog.V(3).Infof("[HR] WatchHandlerLog: Event recieved: %v", event.Type)
 			if e, a := r.expectedType, reflect.TypeOf(event.Object); e != nil && e != a {
 				utilruntime.HandleError(fmt.Errorf("%s: expected type %v, but watch event object had type %v", r.name, e, a))
 				continue
@@ -348,12 +364,15 @@ loop:
 			newResourceVersion := meta.GetResourceVersion()
 			switch event.Type {
 			case watch.Added:
+				klog.V(3).Infof("[HR] WatchHandlerLog: Event Added: %v", event.Type)
 				err := r.store.Add(event.Object)
 				if err != nil {
 					utilruntime.HandleError(fmt.Errorf("%s: unable to add watch event object (%#v) to store: %v", r.name, event.Object, err))
 				}
 			case watch.Modified:
+				klog.V(3).Infof("[HR] WatchHandlerLog: Event Modified: %v", event.Type)
 				err := r.store.Update(event.Object)
+				klog.V(3).Infof("[HR] WatchHandlerLog: After updating Store: %v, error: %v", event.Type, err)
 				if err != nil {
 					utilruntime.HandleError(fmt.Errorf("%s: unable to update watch event object (%#v) to store: %v", r.name, event.Object, err))
 				}
@@ -361,13 +380,16 @@ loop:
 				// TODO: Will any consumers need access to the "last known
 				// state", which is passed in event.Object? If so, may need
 				// to change this.
+				klog.V(3).Infof("[HR] WatchHandlerLog: Event Deleted: %v", event.Type)
 				err := r.store.Delete(event.Object)
 				if err != nil {
 					utilruntime.HandleError(fmt.Errorf("%s: unable to delete watch event object (%#v) from store: %v", r.name, event.Object, err))
 				}
 			case watch.Bookmark:
 				// A `Bookmark` means watch has synced here, just update the resourceVersion
+				klog.V(3).Infof("[HR] WatchHandlerLog: Watch Bookmark Case triggered: %v", event.Type)
 			default:
+				klog.V(3).Infof("[HR] WatchHandlerLog: Default case: unable to understand the watch event: %v", event.Type)
 				utilruntime.HandleError(fmt.Errorf("%s: unable to understand watch event %#v", r.name, event))
 			}
 			*resourceVersion = newResourceVersion
