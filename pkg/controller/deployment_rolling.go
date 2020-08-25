@@ -44,6 +44,13 @@ var (
 
 // rolloutRolling implements the logic for rolling a new machine set.
 func (dc *controller) rolloutRolling(d *v1alpha1.MachineDeployment, isList []*v1alpha1.MachineSet, machineMap map[types.UID]*v1alpha1.MachineList) error {
+
+	clusterAutoscalerScaleDownAnnotations := make(map[string]string)
+	clusterAutoscalerScaleDownAnnotations[v1alpha1.ClusterAutoscalerScaleDownDisabledAnnotationKey] = v1alpha1.ClusterAutoscalerScaleDownDisabledAnnotationValue
+
+	// We do this avoid accidentally deleting the user provided annotations.
+	clusterAutoscalerScaleDownAnnotations[v1alpha1.ClusterAutoscalerScaleDownDisabledAnnotationByMCMKey] = v1alpha1.ClusterAutoscalerScaleDownDisabledAnnotationByMCMValue
+
 	newIS, oldISs, err := dc.getAllMachineSetsAndSyncRevision(d, isList, machineMap, true)
 	if err != nil {
 		return err
@@ -82,7 +89,24 @@ func (dc *controller) rolloutRolling(d *v1alpha1.MachineDeployment, isList []*v1
 	}
 
 	if MachineDeploymentComplete(d, &d.Status) {
+		// Check if any of the machine under this MachineDeployment contains the by-mcm annotation, and
+		// remove the original autoscaler-annotion only after.
+		err := dc.removeAutoscalerAnnotationsIfRequired(allISs, clusterAutoscalerScaleDownAnnotations)
+		if err != nil {
+			return err
+		}
 		if err := dc.cleanupMachineDeployment(oldISs, d); err != nil {
+			return err
+		}
+	}
+
+	// Check if all the oldMachineSets are set to zero, if not there is likely be a roll-out ongoing.
+	if len(oldISs) > 0 && !MachineDeploymentComplete(d, &d.Status) && !dc.machineSetsScaledToZero(oldISs) {
+
+		// Annotate all the nodes under this machine-deployment, as roll-out is on-going.
+		err := dc.annotateNodesBackingMachineSets(allISs, clusterAutoscalerScaleDownAnnotations)
+		if err != nil {
+			klog.Errorf("Failed to add %s on all nodes. Error: %s", clusterAutoscalerScaleDownAnnotations, err)
 			return err
 		}
 	}
@@ -337,6 +361,162 @@ func (dc *controller) taintNodesBackingMachineSets(MachineSets []*v1alpha1.Machi
 			break
 		}
 		klog.V(2).Infof("Tainted MachineSet object %q with %s to avoid scheduling of pods", machineSet.Name, taint.Key)
+	}
+
+	return nil
+}
+
+// annotateNodesBackingMachineSets annotates all nodes backing the machineSets
+func (dc *controller) annotateNodesBackingMachineSets(MachineSets []*v1alpha1.MachineSet, annotations map[string]string) error {
+
+	for _, machineSet := range MachineSets {
+
+		klog.V(3).Infof("Trying to annotate nodes under the MachineSet object %q with %s", machineSet.Name, annotations)
+		selector, err := metav1.LabelSelectorAsSelector(machineSet.Spec.Selector)
+		if err != nil {
+			return err
+		}
+
+		// list all machines to include the machines that don't match the ms`s selector
+		// anymore but has the stale controller ref.
+		// TODO: Do the List and Filter in a single pass, or use an index.
+		filteredMachines, err := dc.machineLister.List(labels.Everything())
+		if err != nil {
+			return err
+		}
+		// NOTE: filteredMachines are pointing to objects from cache - if you need to
+		// modify them, you need to copy it first.
+		filteredMachines, err = dc.claimMachines(machineSet, selector, filteredMachines)
+		if err != nil {
+			return err
+		}
+
+		// Iterate through all machines and place the PreferNoSchedule taint
+		// to avoid scheduling on older machines
+		for _, machine := range filteredMachines {
+			if machine.Status.Node != "" {
+				err = AddOrUpdateAnnotationOnNode(
+					dc.targetCoreClient,
+					machine.Status.Node,
+					annotations,
+				)
+				if err != nil {
+					klog.Warningf("Adding annotation failed for node: %s, %s", machine.Status.Node, err)
+				}
+			}
+		}
+		klog.V(2).Infof("Annotated the nodes backed by MachineSet %q with %s", machineSet.Name, annotations)
+	}
+
+	return nil
+}
+
+func (dc *controller) machineSetsScaledToZero(MachineSets []*v1alpha1.MachineSet) bool {
+	for _, machineSet := range MachineSets {
+		if machineSet.Spec.Replicas != 0 && machineSet.Status.AvailableReplicas != 0 && machineSet.Status.FullyLabeledReplicas != 0 && machineSet.Status.ReadyReplicas != 0 && machineSet.Status.Replicas != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// removeAnnotationFromNodesBackingMachineSets annotates all nodes backing the machineSets
+func (dc *controller) removeAnnotationFromNodesBackingMachineSets(MachineSets []*v1alpha1.MachineSet, annotations map[string]string) error {
+
+	for _, machineSet := range MachineSets {
+
+		klog.V(3).Infof("Trying to de-annotate nodes under the MachineSet object %q with %s", machineSet.Name, annotations)
+		selector, err := metav1.LabelSelectorAsSelector(machineSet.Spec.Selector)
+		if err != nil {
+			return err
+		}
+
+		// list all machines to include the machines that don't match the ms`s selector
+		// anymore but has the stale controller ref.
+		// TODO: Do the List and Filter in a single pass, or use an index.
+		filteredMachines, err := dc.machineLister.List(labels.Everything())
+		if err != nil {
+			return err
+		}
+		// NOTE: filteredMachines are pointing to objects from cache - if you need to
+		// modify them, you need to copy it first.
+		filteredMachines, err = dc.claimMachines(machineSet, selector, filteredMachines)
+		if err != nil {
+			return err
+		}
+
+		// Iterate through all machines and place the PreferNoSchedule taint
+		// to avoid scheduling on older machines
+		for _, machine := range filteredMachines {
+			if machine.Status.Node != "" {
+				err = RemoveAnnotationsOffNode(
+					dc.targetCoreClient,
+					machine.Status.Node,
+					annotations,
+				)
+				if err != nil {
+					klog.Warningf("Removing annotation failed for node: %s, %s", machine.Status.Node, err)
+				}
+			}
+		}
+		klog.V(2).Infof("De-annotated the nodes backed by MachineSet %q with %s", machineSet.Name, annotations)
+	}
+
+	return nil
+}
+
+// removeAutoscalerAnnotationsIfRequired removes the annotations if needed from nodes backing machinesets.
+func (dc *controller) removeAutoscalerAnnotationsIfRequired(MachineSets []*v1alpha1.MachineSet, annotations map[string]string) error {
+
+	for _, machineSet := range MachineSets {
+
+		selector, err := metav1.LabelSelectorAsSelector(machineSet.Spec.Selector)
+		if err != nil {
+			return err
+		}
+
+		// list all machines to include the machines that don't match the ms`s selector
+		// anymore but has the stale controller ref.
+		// TODO: Do the List and Filter in a single pass, or use an index.
+		filteredMachines, err := dc.machineLister.List(labels.Everything())
+		if err != nil {
+			return err
+		}
+		// NOTE: filteredMachines are pointing to objects from cache - if you need to
+		// modify them, you need to copy it first.
+		filteredMachines, err = dc.claimMachines(machineSet, selector, filteredMachines)
+		if err != nil {
+			return err
+		}
+
+		for _, machine := range filteredMachines {
+			if machine.Status.Node != "" {
+
+				nodeAnnotations, err := GetAnnotationsFromNode(
+					dc.targetCoreClient,
+					machine.Status.Node,
+				)
+				if err != nil {
+					klog.Warningf("Get annotations failed for node: %s, %s", machine.Status.Node, err)
+					return err
+				}
+
+				// Remove the autoscaler-related annotation only if the by-mcm annotation is already set. If
+				// by-mcm annotation is not set, the original annotation is likely be put by the end-user for their usecases.
+				if _, exists := nodeAnnotations[v1alpha1.ClusterAutoscalerScaleDownDisabledAnnotationByMCMKey]; exists {
+					err = RemoveAnnotationsOffNode(
+						dc.targetCoreClient,
+						machine.Status.Node,
+						annotations,
+					)
+					if err != nil {
+						klog.Warningf("Removing annotation failed for node: %s, %s", machine.Status.Node, err)
+						return err
+					}
+					klog.V(3).Infof("De-annotated the node %q backed by MachineSet %q with %s", machine.Status.Node, machineSet.Name, annotations)
+				}
+			}
+		}
 	}
 
 	return nil

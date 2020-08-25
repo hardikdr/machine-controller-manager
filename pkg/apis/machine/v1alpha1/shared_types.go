@@ -72,3 +72,15 @@ type MachineSummary struct {
 	// OwnerRef
 	OwnerRef string `json:"ownerRef,omitempty"`
 }
+
+const (
+	// ClusterAutoscalerScaleDownDisabledAnnotationKey annotation to disable the scale-down of the nodes.
+	ClusterAutoscalerScaleDownDisabledAnnotationKey = "cluster-autoscaler.kubernetes.io/scale-down-disabled"
+	// ClusterAutoscalerScaleDownDisabledAnnotationValue annotation to disable the scale-down of the nodes.
+	ClusterAutoscalerScaleDownDisabledAnnotationValue = "True"
+
+	// ClusterAutoscalerScaleDownDisabledAnnotationByMCMKey annotation to disable the scale-down of the nodes.
+	ClusterAutoscalerScaleDownDisabledAnnotationByMCMKey = "cluster-autoscaler.kubernetes.io/scale-down-disabled-by-mcm"
+	// ClusterAutoscalerScaleDownDisabledAnnotationByMCMValue annotation to disable the scale-down of the nodes.
+	ClusterAutoscalerScaleDownDisabledAnnotationByMCMValue = "True"
+)
