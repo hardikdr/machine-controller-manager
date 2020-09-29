@@ -200,6 +200,7 @@ func (c *controller) reconcileClusterMachine(machine *v1alpha1.Machine) error {
 	if machine.DeletionTimestamp != nil {
 		// Processing of delete event
 		if err := c.machineDelete(machine, driver); err != nil {
+			c.enqueueMachineAfter(machine, 30*time.Second)
 			return err
 		}
 	} else if machine.Status.CurrentStatus.TimeoutActive {
@@ -213,7 +214,8 @@ func (c *controller) reconcileClusterMachine(machine *v1alpha1.Machine) error {
 			return nil
 		} else if actualProviderID == "" {
 			if err := c.machineCreate(machine, driver); err != nil {
-				return err
+				c.enqueueMachineAfter(machine, 30*time.Second)
+				return nil
 			}
 		} else if actualProviderID != machine.Spec.ProviderID {
 			if err := c.machineUpdate(machine, actualProviderID); err != nil {
@@ -246,7 +248,7 @@ func (c *controller) addNodeToMachine(obj interface{}) {
 	}
 
 	klog.V(4).Infof("Add machine object backing node %q", machine.Name)
-	c.enqueueMachine(machine)
+	c.enqueueMachineAfter(machine, 30*time.Second)
 }
 
 func (c *controller) updateNodeToMachine(oldObj, newObj interface{}) {

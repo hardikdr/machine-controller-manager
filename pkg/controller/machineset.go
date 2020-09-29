@@ -221,7 +221,7 @@ func (c *controller) updateMachineToMachineSet(old, cur interface{}) {
 	if controllerRefChanged && oldControllerRef != nil {
 		// The ControllerRef was changed. Sync the old controller, if any.
 		if machineSet := c.resolveMachineSetControllerRef(oldMachine.Namespace, oldControllerRef); machineSet != nil {
-			c.enqueueMachineSet(machineSet)
+			c.enqueueMachineSetAfter(machineSet, 3*time.Minute)
 		}
 	}
 
@@ -232,7 +232,7 @@ func (c *controller) updateMachineToMachineSet(old, cur interface{}) {
 			return
 		}
 		klog.V(4).Infof("Machine %s updated, objectMeta %+v -> %+v.", curMachine.Name, oldMachine.ObjectMeta, curMachine.ObjectMeta)
-		c.enqueueMachineSet(machineSet)
+		c.enqueueMachineSetAfter(machineSet, 3*time.Minute)
 		return
 	}
 
@@ -247,7 +247,7 @@ func (c *controller) updateMachineToMachineSet(old, cur interface{}) {
 		}
 		klog.V(4).Infof("Orphan Machine %s updated, objectMeta %+v -> %+v.", curMachine.Name, oldMachine.ObjectMeta, curMachine.ObjectMeta)
 		for _, machineSet := range machineSets {
-			c.enqueueMachineSet(machineSet)
+			c.enqueueMachineSetAfter(machineSet, 3*time.Minute)
 		}
 	}
 
