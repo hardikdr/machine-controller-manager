@@ -52,7 +52,7 @@ const (
 	MachinePriority = "machinepriority.machine.sapcloud.io"
 
 	// MachineEnqueueRetryPeriod period after which a machine object is re-enqueued upon creation or deletion failures.
-	MachineEnqueueRetryPeriod = 3 * time.Minute
+	MachineEnqueueRetryPeriod = 2 * time.Minute
 )
 
 /*
@@ -832,11 +832,11 @@ func (c *controller) updateMachineStatus(
 	currentStatus v1alpha1.CurrentStatus,
 ) (*v1alpha1.Machine, error) {
 	// Get the latest version of the machine so that we can avoid conflicts
-	machine, err := c.controlMachineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
+	latestMachine, err := c.controlMachineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
 	if err != nil {
 		return machine, err
 	}
-	clone := machine.DeepCopy()
+	clone := latestMachine.DeepCopy()
 
 	clone.Status.LastOperation = lastOperation
 	clone.Status.CurrentStatus = currentStatus
