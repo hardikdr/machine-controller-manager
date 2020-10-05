@@ -834,7 +834,7 @@ func (c *controller) updateMachineStatus(
 	// Get the latest version of the machine so that we can avoid conflicts
 	latestMachine, err := c.controlMachineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
 	if err != nil {
-		return machine, err
+		return nil, err
 	}
 	clone := latestMachine.DeepCopy()
 
