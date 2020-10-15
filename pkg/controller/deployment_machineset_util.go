@@ -26,7 +26,7 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
 	machineapi "github.com/gardener/machine-controller-manager/pkg/client/clientset/versioned/typed/machine/v1alpha1"
@@ -60,7 +60,7 @@ func updateMachineSetStatus(machineClient machineapi.MachineV1alpha1Interface, i
 	var getErr, updateErr error
 	var updatedIS *v1alpha1.MachineSet
 	for i, is := 0, is; ; i++ {
-		glog.V(4).Infof(fmt.Sprintf("Updating status for MachineSet: %s/%s, ", is.Namespace, is.Name) +
+		klog.V(4).Infof(fmt.Sprintf("Updating status for MachineSet: %s/%s, ", is.Namespace, is.Name) +
 			fmt.Sprintf("replicas %d->%d (need %d), ", is.Status.Replicas, newStatus.Replicas, is.Spec.Replicas) +
 			fmt.Sprintf("fullyLabeledReplicas %d->%d, ", is.Status.FullyLabeledReplicas, newStatus.FullyLabeledReplicas) +
 			fmt.Sprintf("readyReplicas %d->%d, ", is.Status.ReadyReplicas, newStatus.ReadyReplicas) +
@@ -93,7 +93,7 @@ func calculateMachineSetStatus(is *v1alpha1.MachineSet, filteredMachines []*v1al
 	// Count the number of machines that have labels matching the labels of the machine
 	// template of the machine set, the matching machines may have more
 	// labels than are in the template. Because the label of machineTemplateSpec is
-	// a supeiset of the selector of the machine set, so the possible
+	// a superset of the selector of the machine set, so the possible
 	// matching machines must be part of the filteredmachines.
 	fullyLabeledReplicasCount := 0
 	readyReplicasCount := 0
@@ -117,7 +117,7 @@ func calculateMachineSetStatus(is *v1alpha1.MachineSet, filteredMachines []*v1al
 			machineSummary.Name = machine.Name
 			machineSummary.ProviderID = machine.Spec.ProviderID
 			machineSummary.LastOperation = machine.Status.LastOperation
-			//ownerRef populated here, so that deployment controller doesn't have to add it seperately
+			//ownerRef populated here, so that deployment controller doesn't have to add it separately
 			if controller := metav1.GetControllerOf(machine); controller != nil {
 				machineSummary.OwnerRef = controller.Name
 			}
@@ -152,6 +152,7 @@ func calculateMachineSetStatus(is *v1alpha1.MachineSet, filteredMachines []*v1al
 	newStatus.FullyLabeledReplicas = int32(fullyLabeledReplicasCount)
 	newStatus.ReadyReplicas = int32(readyReplicasCount)
 	newStatus.AvailableReplicas = int32(availableReplicasCount)
+	newStatus.LastOperation.LastUpdateTime = metav1.Now()
 	return newStatus
 }
 

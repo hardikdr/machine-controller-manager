@@ -17,7 +17,7 @@
 
 > Make sure that the `kubernetes/machine_objects/machine.yaml` points to the same class name as the `kubernetes/machine_classes/aws-machine-class.yaml`.
 
-> Similarily `kubernetes/machine_objects/aws-machine-class.yaml` secret name and namespace should be same as that mentioned in `kubernetes/secrets/aws-secret.yaml`
+> Similarly `kubernetes/machine_objects/aws-machine-class.yaml` secret name and namespace should be same as that mentioned in `kubernetes/secrets/aws-secret.yaml`
 
 ## Creating machine
 
@@ -33,7 +33,8 @@ You should notice that the Machine Controller Manager has immediately picked up 
 
 ```bash
 $ kubectl get machine
-test-machine Machine.v1alpha1.machine.sapcloud.io
+NAME           STATUS    AGE
+test-machine   Running   5m
 ```
 
 A new machine is created with the name provided in the `kubernetes/machine_objects/machine.yaml` file.

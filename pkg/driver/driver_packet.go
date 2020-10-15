@@ -24,8 +24,8 @@ import (
 	v1alpha1 "github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/golang/glog"
 	"github.com/packethost/packngo"
+	"k8s.io/klog"
 )
 
 // PacketDriver is the driver struct for holding Packet machine information
@@ -46,38 +46,45 @@ func NewPacketDriver(create func() (string, error), delete func() error, existin
 func (d *PacketDriver) Create() (string, string, error) {
 
 	svc := d.createSVC()
+	if svc == nil {
+		return "", "", fmt.Errorf("nil Packet service returned")
+	}
 	// packet tags are strings only
-	tags := packetTagsMapToString(d.PacketMachineClass.Spec.Tags)
 	createRequest := &packngo.DeviceCreateRequest{
-		UserData:     d.UserData,
-		Plan:         d.PacketMachineClass.Spec.MachineType,
-		ProjectID:    d.PacketMachineClass.Spec.ProjectID,
-		BillingCycle: d.PacketMachineClass.Spec.BillingCycle,
-		Facility:     d.PacketMachineClass.Spec.Facility,
-		OS:           d.PacketMachineClass.Spec.OS,
-		Tags:         tags,
+		Hostname:       d.MachineName,
+		UserData:       d.UserData,
+		Plan:           d.PacketMachineClass.Spec.MachineType,
+		ProjectID:      d.PacketMachineClass.Spec.ProjectID,
+		BillingCycle:   d.PacketMachineClass.Spec.BillingCycle,
+		Facility:       d.PacketMachineClass.Spec.Facility,
+		OS:             d.PacketMachineClass.Spec.OS,
+		ProjectSSHKeys: d.PacketMachineClass.Spec.SSHKeys,
+		Tags:           d.PacketMachineClass.Spec.Tags,
 	}
 
 	device, _, err := svc.Devices.Create(createRequest)
 	if err != nil {
-		glog.Errorf("Could not create machine: %v", err)
+		klog.Errorf("Could not create machine: %v", err)
 		return "", "", err
 	}
 	return d.encodeMachineID(device.Facility.ID, device.ID), device.Hostname, nil
 }
 
 // Delete method is used to delete a Packet machine
-func (d *PacketDriver) Delete() error {
+func (d *PacketDriver) Delete(machineID string) error {
 
 	svc := d.createSVC()
-	machineID := d.decodeMachineID(d.MachineID)
-	resp, err := svc.Devices.Delete(machineID)
+	if svc == nil {
+		return fmt.Errorf("nil Packet service returned")
+	}
+	instanceID := d.decodeMachineID(machineID)
+	resp, err := svc.Devices.Delete(instanceID)
 	if err != nil {
 		if resp.StatusCode == 404 {
-			glog.V(2).Infof("No machine matching the machine-ID found on the provider %q", d.MachineID)
+			klog.V(2).Infof("No machine matching the machine-ID found on the provider %q", machineID)
 			return nil
 		}
-		glog.Errorf("Could not terminate machine %s: %v", d.MachineID, err)
+		klog.Errorf("Could not terminate machine %s: %v", machineID, err)
 		return err
 	}
 	return nil
@@ -96,7 +103,7 @@ func (d *PacketDriver) GetVMs(machineID string) (VMs, error) {
 	clusterName := ""
 	nodeRole := ""
 
-	for key := range d.PacketMachineClass.Spec.Tags {
+	for _, key := range d.PacketMachineClass.Spec.Tags {
 		if strings.Contains(key, "kubernetes.io/cluster/") {
 			clusterName = key
 		} else if strings.Contains(key, "kubernetes.io/role/") {
@@ -109,15 +116,27 @@ func (d *PacketDriver) GetVMs(machineID string) (VMs, error) {
 	}
 
 	svc := d.createSVC()
+	if svc == nil {
+		return nil, fmt.Errorf("nil Packet service returned")
+	}
 	if machineID == "" {
 		devices, _, err := svc.Devices.List(d.PacketMachineClass.Spec.ProjectID, &packngo.ListOptions{})
 		if err != nil {
-			glog.Errorf("Could not list devices for project %s: %v", d.PacketMachineClass.Spec.ProjectID, err)
+			klog.Errorf("Could not list devices for project %s: %v", d.PacketMachineClass.Spec.ProjectID, err)
 			return nil, err
 		}
 		for _, d := range devices {
-			tags := packetTagsStringToMap(d.Tags)
-			if v, ok := tags[clusterName]; ok && v == nodeRole {
+			matchedCluster := false
+			matchedRole := false
+			for _, tag := range d.Tags {
+				switch tag {
+				case clusterName:
+					matchedCluster = true
+				case nodeRole:
+					matchedRole = true
+				}
+			}
+			if matchedCluster && matchedRole {
 				listOfVMs[d.ID] = d.Hostname
 			}
 		}
@@ -125,7 +144,7 @@ func (d *PacketDriver) GetVMs(machineID string) (VMs, error) {
 		machineID = d.decodeMachineID(machineID)
 		device, _, err := svc.Devices.Get(machineID, &packngo.GetOptions{})
 		if err != nil {
-			glog.Errorf("Could not get device %s: %v", machineID, err)
+			klog.Errorf("Could not get device %s: %v", machineID, err)
 			return nil, err
 		}
 		listOfVMs[machineID] = device.Hostname
@@ -154,19 +173,18 @@ func (d *PacketDriver) decodeMachineID(id string) string {
 	return splitProviderID[len(splitProviderID)-1]
 }
 
-func packetTagsMapToString(tags map[string]string) []string {
-	ret := make([]string, 0)
-	for k, v := range tags {
-		ret = append(ret, fmt.Sprintf("%s:%s", k, v))
-	}
-	return ret
+// GetVolNames parses volume names from pv specs
+func (d *PacketDriver) GetVolNames(specs []corev1.PersistentVolumeSpec) ([]string, error) {
+	names := []string{}
+	return names, fmt.Errorf("Not implemented yet")
 }
 
-func packetTagsStringToMap(tags []string) map[string]string {
-	ret := map[string]string{}
-	for _, t := range tags {
-		parts := strings.SplitN(t, ":", 2)
-		ret[parts[0]] = parts[1]
-	}
-	return ret
+//GetUserData return the used data whit which the VM will be booted
+func (d *PacketDriver) GetUserData() string {
+	return d.UserData
+}
+
+//SetUserData set the used data whit which the VM will be booted
+func (d *PacketDriver) SetUserData(userData string) {
+	d.UserData = userData
 }

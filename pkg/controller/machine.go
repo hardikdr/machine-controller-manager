@@ -21,16 +21,20 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -46,6 +50,9 @@ const (
 	// priority the more likely it is to be deleted first
 	// Default priority for a machine is set to 3
 	MachinePriority = "machinepriority.machine.sapcloud.io"
+
+	// MachineEnqueueRetryPeriod period after which a machine object is re-enqueued upon creation or deletion failures.
+	MachineEnqueueRetryPeriod = 2 * time.Minute
 )
 
 /*
@@ -53,39 +60,55 @@ const (
 	Machine controller - Machine add, update, delete watches
 */
 func (c *controller) addMachine(obj interface{}) {
-	key, err := cache.MetaNamespaceKeyFunc(obj)
-	if err != nil {
-		glog.Errorf("Couldn't get key for object %+v: %v", obj, err)
-		return
-	}
-	glog.V(4).Infof("Add/Update/Delete machine object %q", key)
-	c.machineQueue.Add(key)
+	klog.V(4).Infof("Adding machine object")
+	c.enqueueMachine(obj)
 }
 
 func (c *controller) updateMachine(oldObj, newObj interface{}) {
-	glog.V(4).Info("Updating machine object")
-	c.addMachine(newObj)
+	klog.V(4).Info("Updating machine object")
+	c.enqueueMachine(newObj)
 }
 
 func (c *controller) deleteMachine(obj interface{}) {
-	glog.V(4).Info("Deleting machine object")
-	c.addMachine(obj)
+	klog.V(4).Info("Deleting machine object")
+	c.enqueueMachine(obj)
 }
 
 func (c *controller) enqueueMachine(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
+		klog.Errorf("Couldn't get key for object %+v: %v", obj, err)
 		return
 	}
-	c.machineQueue.Add(key)
+
+	machine := obj.(*v1alpha1.Machine)
+	switch machine.Spec.Class.Kind {
+	case AlicloudMachineClassKind, AWSMachineClassKind, AzureMachineClassKind, GCPMachineClassKind, OpenStackMachineClassKind, PacketMachineClassKind:
+		// Checking if machineClass is to be processed by MCM, and then only enqueue the machine object
+		klog.V(4).Infof("Adding machine object to the queue %q", key)
+		c.machineQueue.Add(key)
+	default:
+		klog.V(4).Infof("ClassKind %q not found. Machine maybe be processed by external controller", machine.Spec.Class.Kind)
+	}
 }
 
 func (c *controller) enqueueMachineAfter(obj interface{}, after time.Duration) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
+		klog.Errorf("Couldn't get key for object %+v: %v", obj, err)
 		return
 	}
-	c.machineQueue.AddAfter(key, after)
+
+	machine := obj.(*v1alpha1.Machine)
+
+	switch machine.Spec.Class.Kind {
+	case AlicloudMachineClassKind, AWSMachineClassKind, AzureMachineClassKind, GCPMachineClassKind, OpenStackMachineClassKind, PacketMachineClassKind:
+		// Checking if machineClass is to be processed by MCM, and then only enqueue the machine object
+		klog.V(4).Infof("Adding machine object to the queue %q after %s", key, after)
+		c.machineQueue.AddAfter(key, after)
+	default:
+		klog.V(4).Infof("ClassKind %q not found. Machine maybe be processed by external controller", machine.Spec.Class.Kind)
+	}
 }
 
 func (c *controller) reconcileClusterMachineKey(key string) error {
@@ -96,12 +119,12 @@ func (c *controller) reconcileClusterMachineKey(key string) error {
 
 	machine, err := c.machineLister.Machines(c.namespace).Get(name)
 	if apierrors.IsNotFound(err) {
-		glog.V(4).Infof("Machine %q: Not doing work because it is not found", key)
+		klog.V(4).Infof("Machine %q: Not doing work because it is not found", key)
 		return nil
 	}
 
 	if err != nil {
-		glog.Errorf("ClusterMachine %q: Unable to retrieve object from store: %v", key, err)
+		klog.Errorf("ClusterMachine %q: Unable to retrieve object from store: %v", key, err)
 		return err
 	}
 
@@ -109,15 +132,15 @@ func (c *controller) reconcileClusterMachineKey(key string) error {
 }
 
 func (c *controller) reconcileClusterMachine(machine *v1alpha1.Machine) error {
-	glog.V(3).Info("Start Reconciling machine: ", machine.Name)
+	klog.V(4).Info("Start Reconciling machine: ", machine.Name)
 	defer func() {
 		c.enqueueMachineAfter(machine, 10*time.Minute)
-		glog.V(3).Info("Stop Reconciling machine: ", machine.Name)
+		klog.V(4).Info("Stop Reconciling machine: ", machine.Name)
 	}()
 
 	if c.safetyOptions.MachineControllerFrozen && machine.DeletionTimestamp == nil {
 		message := "Machine controller has frozen. Retrying reconcile after 10 minutes"
-		glog.V(3).Info(message)
+		klog.V(3).Info(message)
 		return errors.New(message)
 	}
 
@@ -133,14 +156,15 @@ func (c *controller) reconcileClusterMachine(machine *v1alpha1.Machine) error {
 	}
 	validationerr := validation.ValidateMachine(internalMachine)
 	if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-		glog.Errorf("Validation of Machine failed %s", validationerr.ToAggregate().Error())
+		klog.Errorf("Validation of Machine failed %s", validationerr.ToAggregate().Error())
 		return nil
 	}
 
 	// Validate MachineClass
 	MachineClass, secretRef, err := c.validateMachineClass(&machine.Spec.Class)
 	if err != nil || secretRef == nil {
-		return err
+		c.enqueueMachineAfter(machine, MachineEnqueueRetryPeriod)
+		return nil
 	}
 
 	driver := driver.NewDriver(machine.Spec.ProviderID, secretRef, machine.Spec.Class.Kind, MachineClass, machine.Name)
@@ -148,28 +172,42 @@ func (c *controller) reconcileClusterMachine(machine *v1alpha1.Machine) error {
 	if err != nil {
 		return err
 	} else if actualProviderID == "fake" {
-		glog.Warning("Fake driver type")
+		klog.Warning("Fake driver type")
 		return nil
 	}
 
-	//glog.Info("REACHED ", actualProviderID, " ", machineID)
-	// Get the latest version of the machine so that we can avoid conflicts
 	machine, err = c.controlMachineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
 	if err != nil {
-		glog.Errorf("Could not fetch machine object %s", err)
+		klog.Errorf("Could not fetch machine object %s", err)
+		if apierrors.IsNotFound(err) {
+			// Ignore the error "Not Found"
+			return nil
+		}
+
 		return err
 	}
 
 	machine, err = c.updateMachineState(machine)
 	if err != nil {
-		glog.Errorf("Could not update machine state for: %s", machine.Name)
+		klog.Errorf("Could not update machine state for: %s", machine.Name)
 		return err
+	}
+
+	// Sync nodeTemplate between machine and node-objects.
+	node, _ := c.nodeLister.Get(machine.Status.Node)
+	if node != nil {
+		err = c.syncMachineNodeTemplates(machine)
+		if err != nil {
+			klog.Errorf("Could not update nodeTemplate for machine %s err: %q", machine.Name, err)
+			return err
+		}
 	}
 
 	if machine.DeletionTimestamp != nil {
 		// Processing of delete event
 		if err := c.machineDelete(machine, driver); err != nil {
-			return err
+			c.enqueueMachineAfter(machine, MachineEnqueueRetryPeriod)
+			return nil
 		}
 	} else if machine.Status.CurrentStatus.TimeoutActive {
 		// Processing machine
@@ -182,7 +220,8 @@ func (c *controller) reconcileClusterMachine(machine *v1alpha1.Machine) error {
 			return nil
 		} else if actualProviderID == "" {
 			if err := c.machineCreate(machine, driver); err != nil {
-				return err
+				c.enqueueMachineAfter(machine, MachineEnqueueRetryPeriod)
+				return nil
 			}
 		} else if actualProviderID != machine.Spec.ProviderID {
 			if err := c.machineUpdate(machine, actualProviderID); err != nil {
@@ -199,22 +238,31 @@ func (c *controller) reconcileClusterMachine(machine *v1alpha1.Machine) error {
 	Machine controller - nodeToMachine
 */
 func (c *controller) addNodeToMachine(obj interface{}) {
+
+	node := obj.(*corev1.Node)
+	if node == nil {
+		klog.Errorf("Couldn't convert to node from object")
+		return
+	}
+
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
-		glog.Errorf("Couldn't get key for object %+v: %v", obj, err)
+		klog.Errorf("Couldn't get key for object %+v: %v", obj, err)
 		return
 	}
 
 	machine, err := c.getMachineFromNode(key)
 	if err != nil {
-		glog.Errorf("Couldn't fetch machine %s, Error: %s", key, err)
+		klog.Errorf("Couldn't fetch machine %s, Error: %s", key, err)
 		return
 	} else if machine == nil {
 		return
 	}
 
-	glog.V(3).Infof("Add machine object backing node %q", machine.Name)
-	c.enqueueMachine(machine)
+	if machine.Status.CurrentStatus.Phase != v1alpha1.MachineCrashLoopBackOff && nodeConditionsHaveChanged(machine.Status.Conditions, node.Status.Conditions) {
+		klog.V(2).Infof("Enqueue machine object %q as backing node's conditions have changed", machine.Name)
+		c.enqueueMachine(machine)
+	}
 }
 
 func (c *controller) updateNodeToMachine(oldObj, newObj interface{}) {
@@ -222,7 +270,28 @@ func (c *controller) updateNodeToMachine(oldObj, newObj interface{}) {
 }
 
 func (c *controller) deleteNodeToMachine(obj interface{}) {
-	c.addNodeToMachine(obj)
+
+	node := obj.(*corev1.Node)
+	if node == nil {
+		klog.Errorf("Couldn't convert to node from object")
+		return
+	}
+
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		klog.Errorf("Couldn't get key for object %+v: %v", obj, err)
+		return
+	}
+
+	machine, err := c.getMachineFromNode(key)
+	if err != nil {
+		klog.Errorf("Couldn't fetch machine %s, Error: %s", key, err)
+		return
+	} else if machine == nil {
+		return
+	}
+
+	c.enqueueMachine(machine)
 }
 
 /*
@@ -250,14 +319,43 @@ func (c *controller) getMachineFromNode(nodeName string) (*v1alpha1.Machine, err
 }
 
 func (c *controller) updateMachineState(machine *v1alpha1.Machine) (*v1alpha1.Machine, error) {
+	nodeName := machine.Status.Node
 
-	if machine.Status.Node == "" {
-		// There are no objects mapped to this machine object
-		// Hence node status need not be propogated to machine object
-		return machine, nil
+	if nodeName == "" {
+		// Check if any existing node-object can be adopted.
+		nodeList, err := c.nodeLister.List(labels.Everything())
+		if err != nil {
+			klog.Errorf("Could not list the nodes due to error: %v", err)
+			return machine, err
+		}
+		for _, node := range nodeList {
+			nID, mID := decodeMachineID(node.Spec.ProviderID), decodeMachineID(machine.Spec.ProviderID)
+			if nID == "" {
+				continue
+			}
+
+			if nID == mID {
+				klog.V(2).Infof("Adopting the node object %s for machine %s", node.Name, machine.Name)
+				nodeName = node.Name
+				clone := machine.DeepCopy()
+				clone.Status.Node = nodeName
+				clone, err = c.controlMachineClient.Machines(clone.Namespace).UpdateStatus(clone)
+				if err != nil {
+					klog.Errorf("Could not update status of the machine-object %s due to error %v", machine.Name, err)
+					return machine, err
+				}
+				break
+			}
+		}
+		// Couldnt adopt any node-object.
+		if nodeName == "" {
+			// There are no objects mapped to this machine object
+			// Hence node status need not be propogated to machine object
+			return machine, nil
+		}
 	}
 
-	node, err := c.nodeLister.Get(machine.Status.Node)
+	node, err := c.nodeLister.Get(nodeName)
 	if err != nil && apierrors.IsNotFound(err) {
 		// Node object is not found
 
@@ -270,7 +368,7 @@ func (c *controller) updateMachineState(machine *v1alpha1.Machine) (*v1alpha1.Ma
 				"Node object went missing. Machine %s is unhealthy - changing MachineState to Unknown",
 				machine.Name,
 			)
-			glog.Warning(msg)
+			klog.Warning(msg)
 
 			currentStatus := v1alpha1.CurrentStatus{
 				Phase:          v1alpha1.MachineUnknown,
@@ -285,7 +383,7 @@ func (c *controller) updateMachineState(machine *v1alpha1.Machine) (*v1alpha1.Ma
 			}
 			clone, err := c.updateMachineStatus(machine, lastOperation, currentStatus)
 			if err != nil {
-				glog.Errorf("Machine updated failed for %s, Error: %q", machine.Name, err)
+				klog.Errorf("Machine updated failed for %s, Error: %q", machine.Name, err)
 				return machine, err
 			}
 			return clone, nil
@@ -295,15 +393,30 @@ func (c *controller) updateMachineState(machine *v1alpha1.Machine) (*v1alpha1.Ma
 		return machine, nil
 	} else if err != nil {
 		// Any other types of errors while fetching node object
-		glog.Errorf("Could not fetch node object for machine %s", machine.Name)
+		klog.Errorf("Could not fetch node object for machine %s", machine.Name)
 		return machine, err
 	}
 
-	clone, err := c.updateMachineConditions(machine, node.Status.Conditions)
+	machine, err = c.updateMachineConditions(machine, node.Status.Conditions)
 	if err != nil {
 		return machine, err
 	}
-	return clone, nil
+
+	clone := machine.DeepCopy()
+	if clone.Labels == nil {
+		clone.Labels = make(map[string]string)
+	}
+
+	if n := clone.Labels["node"]; n == "" {
+		clone.Labels["node"] = machine.Status.Node
+		machine, err = c.controlMachineClient.Machines(clone.Namespace).Update(clone)
+		if err != nil {
+			klog.Warningf("Machine update failed. Retrying, error: %s", err)
+			return machine, err
+		}
+	}
+
+	return machine, nil
 }
 
 /*
@@ -312,13 +425,14 @@ func (c *controller) updateMachineState(machine *v1alpha1.Machine) (*v1alpha1.Ma
 */
 
 func (c *controller) machineCreate(machine *v1alpha1.Machine, driver driver.Driver) error {
-	glog.V(2).Infof("Creating machine %s, please wait!", machine.Name)
+	klog.V(2).Infof("Creating machine %q, please wait!", machine.Name)
+	var actualProviderID, nodeName string
 
-	actualProviderID, nodeName, err := driver.Create()
+	err := c.addBootstrapTokenToUserData(machine.Name, driver)
 	if err != nil {
-		glog.Errorf("Error while creating machine %s: %s", machine.Name, err.Error())
+		klog.Errorf("Error while creating bootstrap token for machine %s: %s", machine.Name, err.Error())
 		lastOperation := v1alpha1.LastOperation{
-			Description:    "Cloud provider message - " + err.Error(),
+			Description:    "MCM message - " + err.Error(),
 			State:          v1alpha1.MachineStateFailed,
 			Type:           v1alpha1.MachineOperationCreate,
 			LastUpdateTime: metav1.Now(),
@@ -331,13 +445,90 @@ func (c *controller) machineCreate(machine *v1alpha1.Machine, driver driver.Driv
 		c.updateMachineStatus(machine, lastOperation, currentStatus)
 		return err
 	}
-	glog.V(2).Infof("Created machine: %s, MachineID: %s", machine.Name, actualProviderID)
+	// Before actually creating the machine, we should once check and adopt if the virtual machine already exists.
+	VMList, err := driver.GetVMs("")
+	if err != nil {
+
+		klog.Errorf("Error while listing machine %s: %s", machine.Name, err.Error())
+		lastOperation := v1alpha1.LastOperation{
+			Description:    "Cloud provider message - " + err.Error(),
+			State:          v1alpha1.MachineStateFailed,
+			Type:           v1alpha1.MachineOperationCreate,
+			LastUpdateTime: metav1.Now(),
+		}
+		currentStatus := v1alpha1.CurrentStatus{
+			Phase:          v1alpha1.MachineCrashLoopBackOff,
+			TimeoutActive:  false,
+			LastUpdateTime: metav1.Now(),
+		}
+		c.updateMachineStatus(machine, lastOperation, currentStatus)
+
+		// Delete the bootstrap token
+		if err := c.deleteBootstrapToken(machine.Name); err != nil {
+			klog.Warning(err)
+		}
+
+		klog.Errorf("Failed to list VMs before creating machine %q %+v", machine.Name, err)
+		return err
+	}
+	for providerID, machineName := range VMList {
+		if machineName == machine.Name {
+			klog.V(2).Infof("Adopted an existing VM %s for machine object %s.", providerID, machineName)
+			actualProviderID = providerID
+		}
+	}
+	if actualProviderID == "" {
+		actualProviderID, nodeName, err = driver.Create()
+	}
+
+	if err != nil {
+		klog.Errorf("Error while creating machine %s: %s", machine.Name, err.Error())
+		lastOperation := v1alpha1.LastOperation{
+			Description:    "Cloud provider message - " + err.Error(),
+			State:          v1alpha1.MachineStateFailed,
+			Type:           v1alpha1.MachineOperationCreate,
+			LastUpdateTime: metav1.Now(),
+		}
+		currentStatus := v1alpha1.CurrentStatus{
+			Phase:          v1alpha1.MachineCrashLoopBackOff,
+			TimeoutActive:  false,
+			LastUpdateTime: metav1.Now(),
+		}
+		c.updateMachineStatus(machine, lastOperation, currentStatus)
+
+		// Delete the bootstrap token
+		if err := c.deleteBootstrapToken(machine.Name); err != nil {
+			klog.Warning(err)
+		}
+
+		return err
+	}
+	klog.V(2).Infof("Created/Adopted machine: %q, MachineID: %s", machine.Name, actualProviderID)
 
 	for {
+		machineName := machine.Name
 		// Get the latest version of the machine so that we can avoid conflicts
 		machine, err := c.controlMachineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
 		if err != nil {
-			return err
+
+			if apierrors.IsNotFound(err) {
+				klog.Infof("Machine %q not found on APIServer anymore. Deleting created (orphan) VM", machineName)
+
+				if err = driver.Delete(actualProviderID); err != nil {
+					klog.Errorf(
+						"Deletion failed for orphan machine %q with provider-ID %q: %s",
+						machine.Name,
+						actualProviderID,
+						err,
+					)
+				}
+
+				// Return with error
+				return fmt.Errorf("Couldn't find machine object, hence deleted orphan VM")
+			}
+
+			klog.Warningf("Machine GET failed for %q. Retrying, error: %s", machineName, err)
+			continue
 		}
 
 		lastOperation := v1alpha1.LastOperation{
@@ -353,6 +544,11 @@ func (c *controller) machineCreate(machine *v1alpha1.Machine, driver driver.Driv
 		}
 
 		clone := machine.DeepCopy()
+		if clone.Labels == nil {
+			clone.Labels = make(map[string]string)
+		}
+		clone.Labels["node"] = nodeName
+
 		if clone.Annotations == nil {
 			clone.Annotations = make(map[string]string)
 		}
@@ -362,7 +558,7 @@ func (c *controller) machineCreate(machine *v1alpha1.Machine, driver driver.Driv
 		clone.Spec.ProviderID = actualProviderID
 		machine, err = c.controlMachineClient.Machines(clone.Namespace).Update(clone)
 		if err != nil {
-			glog.Warningf("Machine update failed. Retrying, error: %s", err)
+			klog.Warningf("Machine UPDATE failed for %q. Retrying, error: %s", machineName, err)
 			continue
 		}
 
@@ -372,7 +568,7 @@ func (c *controller) machineCreate(machine *v1alpha1.Machine, driver driver.Driv
 		clone.Status.CurrentStatus = currentStatus
 		_, err = c.controlMachineClient.Machines(clone.Namespace).UpdateStatus(clone)
 		if err != nil {
-			glog.Warningf("Machine/status update failed. Retrying, error: %s", err)
+			klog.Warningf("Machine/status UPDATE failed for %q. Retrying, error: %s", machineName, err)
 			continue
 		}
 		// Update went through, exit out of infinite loop
@@ -383,12 +579,12 @@ func (c *controller) machineCreate(machine *v1alpha1.Machine, driver driver.Driv
 }
 
 func (c *controller) machineUpdate(machine *v1alpha1.Machine, actualProviderID string) error {
-	glog.V(2).Infof("Setting MachineId of %s to %s", machine.Name, actualProviderID)
+	klog.V(2).Infof("Setting MachineId of %s to %s", machine.Name, actualProviderID)
 
 	for {
 		machine, err := c.controlMachineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
 		if err != nil {
-			glog.Errorf("Could not fetch machine object while setting up MachineId %s for Machine %s due to error %s", actualProviderID, machine.Name, err)
+			klog.Errorf("Could not fetch machine object while setting up MachineId %s for Machine %s due to error %s", actualProviderID, machine.Name, err)
 			return err
 		}
 
@@ -396,7 +592,7 @@ func (c *controller) machineUpdate(machine *v1alpha1.Machine, actualProviderID s
 		clone.Spec.ProviderID = actualProviderID
 		machine, err = c.controlMachineClient.Machines(clone.Namespace).Update(clone)
 		if err != nil {
-			glog.Warningf("Machine update failed. Retrying, error: %s", err)
+			klog.Warningf("Machine update failed. Retrying, error: %s", err)
 			continue
 		}
 
@@ -410,7 +606,7 @@ func (c *controller) machineUpdate(machine *v1alpha1.Machine, actualProviderID s
 		clone.Status.LastOperation = lastOperation
 		_, err = c.controlMachineClient.Machines(clone.Namespace).UpdateStatus(clone)
 		if err != nil {
-			glog.Warningf("Machine/status update failed. Retrying, error: %s", err)
+			klog.Warningf("Machine/status update failed. Retrying, error: %s", err)
 			continue
 		}
 		// Update went through, exit out of infinite loop
@@ -422,12 +618,55 @@ func (c *controller) machineUpdate(machine *v1alpha1.Machine, actualProviderID s
 
 func (c *controller) machineDelete(machine *v1alpha1.Machine, driver driver.Driver) error {
 	var err error
+	nodeName := machine.Status.Node
 
 	if finalizers := sets.NewString(machine.Finalizers...); finalizers.Has(DeleteFinalizerName) {
-		glog.V(2).Infof("Deleting Machine %s", machine.Name)
+		klog.V(2).Infof("Deleting Machine %q", machine.Name)
+		var (
+			forceDeletePods         = false
+			forceDeleteMachine      = false
+			timeOutOccurred         = false
+			maxEvictRetries         = int32(math.Min(float64(*c.getEffectiveMaxEvictRetries(machine)), c.getEffectiveDrainTimeout(machine).Seconds()/PodEvictionRetryInterval.Seconds()))
+			pvDetachTimeOut         = c.safetyOptions.PvDetachTimeout.Duration
+			timeOutDuration         = c.getEffectiveDrainTimeout(machine).Duration
+			forceDeleteLabelPresent = machine.Labels["force-deletion"] == "True"
+		)
+
+		// Timeout value obtained by subtracting last operation with expected time out period
+		timeOut := metav1.Now().Add(-timeOutDuration).Sub(machine.Status.CurrentStatus.LastUpdateTime.Time)
+		timeOutOccurred = timeOut > 0
+
+		if forceDeleteLabelPresent || timeOutOccurred {
+			// To perform forceful machine drain/delete either one of the below conditions must be satified
+			// 1. force-deletion: "True" label must be present
+			// 2. Deletion operation is more than drain-timeout minutes old
+			forceDeleteMachine = true
+			forceDeletePods = true
+			timeOutDuration = 1 * time.Minute
+			maxEvictRetries = 1
+
+			klog.V(2).Infof(
+				"Force deletion has been triggerred for machine %q due to ForceDeletionLabel:%t, Timeout:%t",
+				machine.Name,
+				forceDeleteLabelPresent,
+				timeOutOccurred,
+			)
+		}
 
 		// If machine was created on the cloud provider
 		machineID, _ := driver.GetExisting()
+
+		// update node with the machine's state prior to termination
+		if nodeName != "" && machineID != "" {
+			if err = c.UpdateNodeTerminationCondition(machine); err != nil {
+				if forceDeleteMachine {
+					klog.Warningf("failed to update node conditions: %v. However, since it's a force deletion shall continue deletion of VM.", err)
+				} else {
+					klog.Error(err)
+					return err
+				}
+			}
+		}
 
 		if machine.Status.CurrentStatus.Phase != v1alpha1.MachineTerminating {
 			lastOperation := v1alpha1.LastOperation{
@@ -441,64 +680,98 @@ func (c *controller) machineDelete(machine *v1alpha1.Machine, driver driver.Driv
 				TimeoutActive:  false,
 				LastUpdateTime: metav1.Now(),
 			}
+
+			err = c.deleteBootstrapToken(machine.Name)
+			if err != nil {
+				klog.Warning(err)
+			}
+
 			machine, err = c.updateMachineStatus(machine, lastOperation, currentStatus)
 			if err != nil && apierrors.IsNotFound(err) {
 				// Object no longer exists and has been deleted
-				glog.Warning(err)
+				klog.Warning(err)
 				return nil
 			} else if err != nil {
 				// Any other type of errors
-				glog.Error(err)
+				klog.Error(err)
 				return err
 			}
 		}
 
-		if machineID != "" {
-			timeOutDuration := c.safetyOptions.MachineDrainTimeout.Duration
-			// Timeout value obtained by subtracting last operation with expected time out period
-			timeOut := metav1.Now().Add(-timeOutDuration).Sub(machine.Status.CurrentStatus.LastUpdateTime.Time)
+		if machineID != "" && nodeName != "" {
+			// Begin drain logic only when the nodeName & providerID exist's for the machine
+			buf := bytes.NewBuffer([]byte{})
+			errBuf := bytes.NewBuffer([]byte{})
 
-			// To perform drain 2 conditions must be satified
-			// 1. force-deletion: "True" label must not be present
-			// 2. Deletion operation must be less than 5 minutes old
-			if machine.Labels["force-deletion"] != "True" && timeOut < 0 {
-				buf := bytes.NewBuffer([]byte{})
-				errBuf := bytes.NewBuffer([]byte{})
+			drainOptions := NewDrainOptions(
+				c.targetCoreClient,
+				timeOutDuration,
+				maxEvictRetries,
+				pvDetachTimeOut,
+				nodeName,
+				5*time.Minute,
+				-1,
+				forceDeletePods,
+				true,
+				true,
+				true,
+				buf,
+				errBuf,
+				driver,
+				c.pvcLister,
+				c.pvLister,
+			)
+			err = drainOptions.RunDrain()
+			if err == nil {
+				// Drain successful
+				klog.V(2).Infof("Drain successful for machine %q. \nBuf:%v \nErrBuf:%v", machine.Name, buf, errBuf)
 
-				nodeName := machine.Status.Node
-				drainOptions := NewDrainOptions(
-					c.targetCoreClient,
-					timeOutDuration, // TODO: Will need to configure timeout
-					nodeName,
-					-1,
-					true,
-					true,
-					true,
-					buf,
-					errBuf,
-				)
-				err = drainOptions.RunDrain()
-				if err != nil {
-					lastOperation := v1alpha1.LastOperation{
-						Description:    "Drain failed - " + err.Error(),
-						State:          v1alpha1.MachineStateFailed,
-						Type:           v1alpha1.MachineOperationDelete,
-						LastUpdateTime: metav1.Now(),
-					}
-					c.updateMachineStatus(machine, lastOperation, machine.Status.CurrentStatus)
+			} else if err != nil && forceDeleteMachine {
+				// Drain failed on force deletion
+				klog.Warningf("Drain failed for machine %q. However, since it's a force deletion shall continue deletion of VM. \nBuf:%v \nErrBuf:%v \nErr-Message:%v", machine.Name, buf, errBuf, err)
 
-					// Machine still tries to terminate after drain failure
-					glog.Warningf("Drain failed for machine %s - \nBuf:%v \nErrBuf:%v \nErr-Message:%v", machine.Name, buf, errBuf, err)
-					return err
+			} else {
+				// Drain failed on normal (non-force) deletion, return error for retry
+				lastOperation := v1alpha1.LastOperation{
+					Description:    "Drain failed - " + err.Error(),
+					State:          v1alpha1.MachineStateFailed,
+					Type:           v1alpha1.MachineOperationDelete,
+					LastUpdateTime: metav1.Now(),
 				}
-				glog.V(2).Infof("Drain successful for machine %s - %v %v", machine.Name, buf, errBuf)
+				c.updateMachineStatus(machine, lastOperation, machine.Status.CurrentStatus)
+
+				klog.Warningf("Drain failed for machine %q. \nBuf:%v \nErrBuf:%v \nErr-Message:%v", machine.Name, buf, errBuf, err)
+				return err
 			}
-			err = driver.Delete()
+
+			err = driver.Delete(machineID)
+		} else {
+			klog.V(2).Infof("Machine %q on deletion doesn't have a providerID attached to it. Checking for any VM linked to this machine object.", machine.Name)
+			// As MachineID is missing, we should check once if actual VM was created but MachineID was not updated on machine-object.
+			// We list VMs and check if any one them map with the given machine-object.
+			var VMList map[string]string
+			VMList, err = driver.GetVMs("")
+			if err == nil {
+				for providerID, machineName := range VMList {
+					if machineName == machine.Name {
+						klog.V(2).Infof("Deleting the VM %s backing the machine-object %s.", providerID, machine.Name)
+						err = driver.Delete(providerID)
+						if err != nil {
+							klog.Errorf("Error deleting the VM %s backing the machine-object %s due to error %v", providerID, machine.Name, err)
+							// Not returning error so that status on the machine object can be updated in the next step if errored.
+						} else {
+							klog.V(2).Infof("VM %s backing the machine-object %s is deleted successfully", providerID, machine.Name)
+						}
+					}
+				}
+			} else {
+				klog.Errorf("Failed to list VMs while deleting the machine %q %v", machine.Name, err)
+			}
 		}
 
 		if err != nil {
 			// When machine deletion fails
-			glog.Errorf("Deletion failed: %s", err)
+			klog.Errorf("Deletion failed for machine %q: %s", machine.Name, err)
 
 			lastOperation := v1alpha1.LastOperation{
 				Description:    "Cloud provider message - " + err.Error(),
@@ -507,24 +780,44 @@ func (c *controller) machineDelete(machine *v1alpha1.Machine, driver driver.Driv
 				LastUpdateTime: metav1.Now(),
 			}
 			currentStatus := v1alpha1.CurrentStatus{
-				Phase:          v1alpha1.MachineFailed,
+				Phase:          v1alpha1.MachineTerminating,
 				TimeoutActive:  false,
 				LastUpdateTime: metav1.Now(),
 			}
 			c.updateMachineStatus(machine, lastOperation, currentStatus)
-
 			return err
 		}
 
+		if nodeName != "" {
+			// Delete node object
+			err = c.targetCoreClient.CoreV1().Nodes().Delete(nodeName, &metav1.DeleteOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				// If its an error, and anyother error than object not found
+				message := fmt.Sprintf("Deletion of Node Object %q failed due to error: %s", nodeName, err)
+				lastOperation := v1alpha1.LastOperation{
+					Description:    message,
+					State:          v1alpha1.MachineStateFailed,
+					Type:           v1alpha1.MachineOperationDelete,
+					LastUpdateTime: metav1.Now(),
+				}
+				c.updateMachineStatus(machine, lastOperation, machine.Status.CurrentStatus)
+				klog.Errorf(message)
+				return err
+			}
+		}
+
+		// Remove finalizers from machine object
 		c.deleteMachineFinalizers(machine)
+
+		// Delete machine object
 		err = c.controlMachineClient.Machines(machine.Namespace).Delete(machine.Name, &metav1.DeleteOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			// If its an error, and anyother error than object not found
-			glog.Errorf("Deletion of Machine Object %s failed due to error: %s", machine.Name, err)
+			klog.Errorf("Deletion of Machine Object %q failed due to error: %s", machine.Name, err)
 			return err
 		}
 
-		glog.V(2).Infof("Machine %s deleted successfully", machine.Name)
+		klog.V(2).Infof("Machine %q deleted successfully", machine.Name)
 	}
 	return nil
 }
@@ -540,22 +833,45 @@ func (c *controller) updateMachineStatus(
 	currentStatus v1alpha1.CurrentStatus,
 ) (*v1alpha1.Machine, error) {
 	// Get the latest version of the machine so that we can avoid conflicts
-	clone, err := c.controlMachineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
+	latestMachine, err := c.controlMachineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
 	if err != nil {
-		return machine, err
+		return nil, err
 	}
+	clone := latestMachine.DeepCopy()
 
-	clone = clone.DeepCopy()
 	clone.Status.LastOperation = lastOperation
 	clone.Status.CurrentStatus = currentStatus
+	if isMachineStatusEqual(clone.Status, machine.Status) {
+		klog.V(3).Infof("Not updating the status of the machine object %q , as it is already same", clone.Name)
+		return machine, nil
+	}
 
 	clone, err = c.controlMachineClient.Machines(clone.Namespace).UpdateStatus(clone)
 	if err != nil {
 		// Keep retrying until update goes through
-		glog.V(3).Infof("Warning: Updated failed, retrying, error: %q", err)
+		klog.V(3).Infof("Warning: Updated failed, retrying, error: %q", err)
 		return c.updateMachineStatus(machine, lastOperation, currentStatus)
 	}
 	return clone, nil
+}
+
+// isMachineStatusEqual checks if the status of 2 machines is similar or not.
+func isMachineStatusEqual(s1, s2 v1alpha1.MachineStatus) bool {
+	tolerateTimeDiff := 30 * time.Minute
+	s1Copy, s2Copy := s1.DeepCopy(), s2.DeepCopy()
+	s1Copy.LastOperation.Description, s2Copy.LastOperation.Description = "", ""
+
+	if (s1Copy.LastOperation.LastUpdateTime.Time.Before(time.Now().Add(tolerateTimeDiff * -1))) || (s2Copy.LastOperation.LastUpdateTime.Time.Before(time.Now().Add(tolerateTimeDiff * -1))) {
+		return false
+	}
+	s1Copy.LastOperation.LastUpdateTime, s2Copy.LastOperation.LastUpdateTime = metav1.Time{}, metav1.Time{}
+
+	if (s1Copy.CurrentStatus.LastUpdateTime.Time.Before(time.Now().Add(tolerateTimeDiff * -1))) || (s2Copy.CurrentStatus.LastUpdateTime.Time.Before(time.Now().Add(tolerateTimeDiff * -1))) {
+		return false
+	}
+	s1Copy.CurrentStatus.LastUpdateTime, s2Copy.CurrentStatus.LastUpdateTime = metav1.Time{}, metav1.Time{}
+
+	return apiequality.Semantic.DeepEqual(s1Copy.LastOperation, s2Copy.LastOperation) && apiequality.Semantic.DeepEqual(s1Copy.CurrentStatus, s2Copy.CurrentStatus)
 }
 
 func (c *controller) updateMachineConditions(machine *v1alpha1.Machine, conditions []v1.NodeCondition) (*v1alpha1.Machine, error) {
@@ -586,7 +902,7 @@ func (c *controller) updateMachineConditions(machine *v1alpha1.Machine, conditio
 		// If machine is not healthy, and current state is running,
 		// change the machinePhase to unknown and activate health check timeout
 		msg = fmt.Sprintf("Machine %s is unhealthy - changing MachineState to Unknown", clone.Name)
-		glog.Warning(msg)
+		klog.Warning(msg)
 
 		clone.Status.CurrentStatus = v1alpha1.CurrentStatus{
 			Phase:          v1alpha1.MachineUnknown,
@@ -609,13 +925,19 @@ func (c *controller) updateMachineConditions(machine *v1alpha1.Machine, conditio
 			clone.Status.LastOperation.State != v1alpha1.MachineStateSuccessful {
 			// When machine creation went through
 			msg = fmt.Sprintf("Machine %s successfully joined the cluster", clone.Name)
+			// Delete the bootstrap token
+			err = c.deleteBootstrapToken(clone.Name)
+			if err != nil {
+				klog.Warning(err)
+			}
+
 			lastOperationType = v1alpha1.MachineOperationCreate
 		} else {
 			// Machine rejoined the cluster after a healthcheck
 			msg = fmt.Sprintf("Machine %s successfully re-joined the cluster", clone.Name)
 			lastOperationType = v1alpha1.MachineOperationHealthCheck
 		}
-		glog.V(2).Infof(msg)
+		klog.V(2).Infof(msg)
 
 		// Machine is ready and has joined/re-joined the cluster
 		clone.Status.LastOperation = v1alpha1.LastOperation{
@@ -637,7 +959,7 @@ func (c *controller) updateMachineConditions(machine *v1alpha1.Machine, conditio
 		clone, err = c.controlMachineClient.Machines(clone.Namespace).UpdateStatus(clone)
 		if err != nil {
 			// Keep retrying until update goes through
-			glog.Warningf("Updated failed, retrying, error: %q", err)
+			klog.Warningf("Updated failed, retrying, error: %q", err)
 			return c.updateMachineConditions(machine, conditions)
 		}
 
@@ -659,7 +981,7 @@ func (c *controller) updateMachineFinalizers(machine *v1alpha1.Machine, finalize
 	_, err = c.controlMachineClient.Machines(clone.Namespace).Update(clone)
 	if err != nil {
 		// Keep retrying until update goes through
-		glog.Warningf("Warning: Updated failed, retrying, error: %q", err)
+		klog.Warningf("Warning: Updated failed, retrying, error: %q", err)
 		c.updateMachineFinalizers(machine, finalizers)
 	}
 }
@@ -703,22 +1025,25 @@ func (c *controller) isHealthy(machine *v1alpha1.Machine) bool {
 		if condition.Type == v1.NodeReady && condition.Status != v1.ConditionTrue {
 			// If Kubelet is not ready
 			return false
-		} else if condition.Type == v1.NodeDiskPressure && condition.Status != v1.ConditionFalse {
-			// If DiskPressure has occurred on node
-			return false
+		}
+		conditions := strings.Split(*c.getEffectiveNodeConditions(machine), ",")
+		for _, c := range conditions {
+			if string(condition.Type) == c && condition.Status != v1.ConditionFalse {
+				return false
+			}
 		}
 	}
 	return true
 }
 
-func (c *controller) getSecret(ref *v1.SecretReference, MachineClassName string) (*v1.Secret, error) {
+func (c *controller) getSecret(ref *v1.SecretReference, machineClassName string) (*v1.Secret, error) {
 	secretRef, err := c.secretLister.Secrets(ref.Namespace).Get(ref.Name)
 	if apierrors.IsNotFound(err) {
-		glog.V(3).Infof("No secret %q: found for MachineClass %q", ref, MachineClassName)
-		return nil, nil
+		klog.V(3).Infof("No secret %q: found for MachineClass %q", ref, machineClassName)
+		return nil, err
 	}
 	if err != nil {
-		glog.Errorf("Unable get secret %q for MachineClass %q: %v", MachineClassName, ref, err)
+		klog.Errorf("Unable get secret %q for MachineClass %q: %v", machineClassName, ref, err)
 		return nil, err
 	}
 	return secretRef, err
@@ -740,9 +1065,9 @@ func (c *controller) checkMachineTimeout(machine *v1alpha1.Machine) {
 		sleepTime := 1 * time.Minute
 
 		if checkCreationTimeout {
-			timeOutDuration = c.safetyOptions.MachineCreationTimeout.Duration
+			timeOutDuration = c.getEffectiveCreationTimeout(machine).Duration
 		} else {
-			timeOutDuration = c.safetyOptions.MachineHealthTimeout.Duration
+			timeOutDuration = c.getEffectiveHealthTimeout(machine).Duration
 		}
 
 		// Timeout value obtained by subtracting last operation with expected time out period
@@ -779,7 +1104,7 @@ func (c *controller) checkMachineTimeout(machine *v1alpha1.Machine) {
 				LastUpdateTime: metav1.Now(),
 			}
 			// Log the error message for machine failure
-			glog.Error(description)
+			klog.Error(description)
 
 			// Update the machine status to reflect the changes
 			c.updateMachineStatus(machine, lastOperation, currentStatus)
@@ -802,4 +1127,65 @@ func shouldReconcileMachine(machine *v1alpha1.Machine, now time.Time) bool {
 	// TODO add more cases where this will be false
 
 	return true
+}
+
+// decodeMachineID is a generic way of decoding the Spec.ProviderID field of node-objects.
+func decodeMachineID(id string) string {
+	splitProviderID := strings.Split(id, "/")
+	return splitProviderID[len(splitProviderID)-1]
+}
+
+// getEffectiveDrainTimeout returns the drainTimeout set on the machine-object, otherwise returns the timeout set using the global-flag.
+func (c *controller) getEffectiveDrainTimeout(machine *v1alpha1.Machine) *metav1.Duration {
+	var effectiveDrainTimeout *metav1.Duration
+	if machine.Spec.MachineConfiguration != nil && machine.Spec.MachineConfiguration.MachineDrainTimeout != nil {
+		effectiveDrainTimeout = machine.Spec.MachineConfiguration.MachineDrainTimeout
+	} else {
+		effectiveDrainTimeout = &c.safetyOptions.MachineDrainTimeout
+	}
+	return effectiveDrainTimeout
+}
+
+// getEffectiveMaxEvictRetries returns the maxEvictRetries set on the machine-object, otherwise returns the evict retries set using the global-flag.
+func (c *controller) getEffectiveMaxEvictRetries(machine *v1alpha1.Machine) *int32 {
+	var maxEvictRetries *int32
+	if machine.Spec.MachineConfiguration != nil && machine.Spec.MachineConfiguration.MaxEvictRetries != nil {
+		maxEvictRetries = machine.Spec.MachineConfiguration.MaxEvictRetries
+	} else {
+		maxEvictRetries = &c.safetyOptions.MaxEvictRetries
+	}
+	return maxEvictRetries
+}
+
+// getEffectiveHealthTimeout returns the healthTimeout set on the machine-object, otherwise returns the timeout set using the global-flag.
+func (c *controller) getEffectiveHealthTimeout(machine *v1alpha1.Machine) *metav1.Duration {
+	var effectiveHealthTimeout *metav1.Duration
+	if machine.Spec.MachineConfiguration != nil && machine.Spec.MachineConfiguration.MachineHealthTimeout != nil {
+		effectiveHealthTimeout = machine.Spec.MachineConfiguration.MachineHealthTimeout
+	} else {
+		effectiveHealthTimeout = &c.safetyOptions.MachineHealthTimeout
+	}
+	return effectiveHealthTimeout
+}
+
+// getEffectiveHealthTimeout returns the creationTimeout set on the machine-object, otherwise returns the timeout set using the global-flag.
+func (c *controller) getEffectiveCreationTimeout(machine *v1alpha1.Machine) *metav1.Duration {
+	var effectiveCreationTimeout *metav1.Duration
+	if machine.Spec.MachineConfiguration != nil && machine.Spec.MachineConfiguration.MachineCreationTimeout != nil {
+		effectiveCreationTimeout = machine.Spec.MachineConfiguration.MachineCreationTimeout
+	} else {
+		effectiveCreationTimeout = &c.safetyOptions.MachineCreationTimeout
+	}
+	return effectiveCreationTimeout
+}
+
+// getEffectiveNodeConditions returns the nodeConditions set on the machine-object, otherwise returns the conditions set using the global-flag.
+func (c *controller) getEffectiveNodeConditions(machine *v1alpha1.Machine) *string {
+	var effectiveNodeConditions *string
+	if machine.Spec.MachineConfiguration != nil && machine.Spec.MachineConfiguration.NodeConditions != nil {
+		effectiveNodeConditions = machine.Spec.MachineConfiguration.NodeConditions
+	} else {
+		effectiveNodeConditions = &c.nodeConditions
+	}
+	return effectiveNodeConditions
 }

@@ -27,13 +27,13 @@ import (
 	"sync"
 
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
-	"github.com/golang/glog"
+
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/klog"
 )
 
 // BaseControllerRefManager is the struct is used to identify the base controller of the object
@@ -208,7 +208,7 @@ func (m *MachineControllerRefManager) ClaimMachines(machines []*v1alpha1.Machine
 	for _, machine := range machines {
 		ok, err := m.ClaimObject(machine, match, adopt, release)
 
-		//glog.Info(machine.Name, " OK:", ok, " ERR:", err)
+		//klog.Info(machine.Name, " OK:", ok, " ERR:", err)
 
 		if err != nil {
 			errlist = append(errlist, err)
@@ -240,7 +240,7 @@ func (m *MachineControllerRefManager) AdoptMachine(machine *v1alpha1.Machine) er
 // ReleaseMachine sends a patch to free the Machine from the control of the controller.
 // It returns the error if the patching fails. 404 and 422 errors are ignored.
 func (m *MachineControllerRefManager) ReleaseMachine(machine *v1alpha1.Machine) error {
-	glog.V(4).Infof("patching machine %s_%s to remove its controllerRef to %s/%s:%s",
+	klog.V(4).Infof("patching machine %s_%s to remove its controllerRef to %s/%s:%s",
 		machine.Namespace, machine.Name, m.controllerKind.GroupVersion(), m.controllerKind.Kind, m.Controller.GetName())
 	deleteOwnerRefPatch := fmt.Sprintf(
 		`{"metadata":{"ownerReferences":[{"$patch":"delete", "apiVersion":"machine.sapcloud.io/v1alpha1","kind":"%s","name":"%s","uid":"%s","controller":true,"blockOwnerDeletion":true}],"uid":"%s"}}`,
@@ -327,7 +327,6 @@ func (m *MachineSetControllerRefManager) ClaimMachineSets(sets []*v1alpha1.Machi
 
 	match := func(obj metav1.Object) bool {
 		machineSet := obj.(*v1alpha1.MachineSet)
-		//return m.Selector.Matches(labels.Set(machineSet.GetLabels()))
 		return m.Selector.Matches(labels.Set(machineSet.Labels))
 	}
 
@@ -369,7 +368,7 @@ func (m *MachineSetControllerRefManager) AdoptMachineSet(is *v1alpha1.MachineSet
 // ReleaseMachineSet sends a patch to free the MachineSet from the control of the MachineDeployment controller.
 // It returns the error if the patching fails. 404 and 422 errors are ignored.
 func (m *MachineSetControllerRefManager) ReleaseMachineSet(machineSet *v1alpha1.MachineSet) error {
-	glog.V(4).Infof("patching MachineSet %s_%s to remove its controllerRef to %s:%s",
+	klog.V(4).Infof("patching MachineSet %s_%s to remove its controllerRef to %s:%s",
 		machineSet.Name, m.controllerKind.GroupVersion(), m.controllerKind.Kind, m.Controller.GetName())
 	//deleteOwnerRefPatch := fmt.Sprintf(`{"metadata":{"ownerReferences":[{"$patch":"delete","uid":"%s"}],"uid":"%s"}}`, m.Controller.GetUID(), machineSet.UID)
 	deleteOwnerRefPatch := fmt.Sprintf(

@@ -18,16 +18,20 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
+	"time"
+
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine"
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/validation"
+	"github.com/gardener/machine-controller-manager/pkg/util/provider/machineutils"
 )
 
 // GCPMachineClassKind is used to identify the machineClassKind as GCP
@@ -66,7 +70,7 @@ func (c *controller) machineToGCPMachineClassDelete(obj interface{}) {
 func (c *controller) gcpMachineClassAdd(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
-		glog.Errorf("Couldn't get key for object %+v: %v", obj, err)
+		klog.Errorf("Couldn't get key for object %+v: %v", obj, err)
 		return
 	}
 	c.gcpMachineClassQueue.Add(key)
@@ -96,33 +100,40 @@ func (c *controller) reconcileClusterGCPMachineClassKey(key string) error {
 	class, err := c.gcpMachineClassLister.GCPMachineClasses(c.namespace).Get(name)
 
 	if errors.IsNotFound(err) {
-		glog.Infof("%s %q: Not doing work because it has been deleted", GCPMachineClassKind, key)
+		klog.Infof("%s %q: Not doing work because it has been deleted", GCPMachineClassKind, key)
 		return nil
 	}
 	if err != nil {
-		glog.Infof("%s %q: Unable to retrieve object from store: %v", GCPMachineClassKind, key, err)
+		klog.Infof("%s %q: Unable to retrieve object from store: %v", GCPMachineClassKind, key, err)
 		return err
 	}
 
-	return c.reconcileClusterGCPMachineClass(class)
+	err = c.reconcileClusterGCPMachineClass(class)
+	if err != nil {
+		c.enqueueGCPMachineClassAfter(class, 10*time.Second)
+	} else {
+		// Re-enqueue periodically to avoid missing of events
+		// TODO: Infuture to get ride of this logic
+		c.enqueueGCPMachineClassAfter(class, 10*time.Minute)
+	}
+
+	return nil
 }
 
 func (c *controller) reconcileClusterGCPMachineClass(class *v1alpha1.GCPMachineClass) error {
+	klog.V(4).Info("Start Reconciling GCPmachineclass: ", class.Name)
+	defer klog.V(4).Info("Stop Reconciling GCPmachineclass: ", class.Name)
+
 	internalClass := &machine.GCPMachineClass{}
 	err := c.internalExternalScheme.Convert(class, internalClass, nil)
 	if err != nil {
 		return err
 	}
-	// TODO this should be put in own API server
+
 	validationerr := validation.ValidateGCPMachineClass(internalClass)
 	if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-		glog.Errorf("Validation of %s failed %s", GCPMachineClassKind, validationerr.ToAggregate().Error())
+		klog.Errorf("Validation of %s failed %s", GCPMachineClassKind, validationerr.ToAggregate().Error())
 		return nil
-	}
-
-	// Manipulate finalizers
-	if class.DeletionTimestamp == nil {
-		c.addGCPMachineClassFinalizers(class)
 	}
 
 	machines, err := c.findMachinesForClass(GCPMachineClassKind, class.Name)
@@ -130,32 +141,41 @@ func (c *controller) reconcileClusterGCPMachineClass(class *v1alpha1.GCPMachineC
 		return err
 	}
 
-	if class.DeletionTimestamp != nil {
-		if finalizers := sets.NewString(class.Finalizers...); !finalizers.Has(DeleteFinalizerName) {
-			return nil
+	if class.DeletionTimestamp == nil {
+		// If deletion timestamp doesn't exist
+		_, annotationPresent := class.Annotations[machineutils.MigratedMachineClass]
+
+		if len(machines) > 0 {
+			// If 1 or more machine objects are referring the machineClass
+			err = c.addGCPMachineClassFinalizers(class)
+			if err != nil {
+				return err
+			}
+		} else if c.deleteMigratedMachineClass && annotationPresent {
+			// If controller has deleteMigratedMachineClass flag set
+			// and the migratedMachineClass annotation is set
+			err = c.controlMachineClient.GCPMachineClasses(class.Namespace).Delete(class.Name, &metav1.DeleteOptions{})
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("Retry deletion as deletion timestamp is now set")
 		}
 
-		machineDeployments, err := c.findMachineDeploymentsForClass(GCPMachineClassKind, class.Name)
-		if err != nil {
-			return err
-		}
-		machineSets, err := c.findMachineSetsForClass(GCPMachineClassKind, class.Name)
-		if err != nil {
-			return err
-		}
-		if len(machineDeployments) == 0 && len(machineSets) == 0 && len(machines) == 0 {
-			c.deleteGCPMachineClassFinalizers(class)
-			return nil
-		}
-
-		glog.V(4).Infof("Cannot remove finalizer of %s because still Machine[s|Sets|Deployments] are referencing it", class.Name)
 		return nil
 	}
 
-	for _, machine := range machines {
-		c.addMachine(machine)
+	if len(machines) > 0 {
+		// machines are still referring the machine class, please wait before deletion
+		klog.V(3).Infof("Cannot remove finalizer on %s because still (%d) machines are referencing it", class.Name, len(machines))
+
+		for _, machine := range machines {
+			c.addMachine(machine)
+		}
+
+		return fmt.Errorf("Retry as machine objects are still referring the machineclass")
 	}
-	return nil
+
+	return c.deleteGCPMachineClassFinalizers(class)
 }
 
 /*
@@ -163,37 +183,48 @@ func (c *controller) reconcileClusterGCPMachineClass(class *v1alpha1.GCPMachineC
 	Manipulate Finalizers
 */
 
-func (c *controller) addGCPMachineClassFinalizers(class *v1alpha1.GCPMachineClass) {
+func (c *controller) addGCPMachineClassFinalizers(class *v1alpha1.GCPMachineClass) error {
 	clone := class.DeepCopy()
 
 	if finalizers := sets.NewString(clone.Finalizers...); !finalizers.Has(DeleteFinalizerName) {
 		finalizers.Insert(DeleteFinalizerName)
-		c.updateGCPMachineClassFinalizers(clone, finalizers.List())
+		return c.updateGCPMachineClassFinalizers(clone, finalizers.List())
 	}
+	return nil
 }
 
-func (c *controller) deleteGCPMachineClassFinalizers(class *v1alpha1.GCPMachineClass) {
+func (c *controller) deleteGCPMachineClassFinalizers(class *v1alpha1.GCPMachineClass) error {
 	clone := class.DeepCopy()
 
 	if finalizers := sets.NewString(clone.Finalizers...); finalizers.Has(DeleteFinalizerName) {
 		finalizers.Delete(DeleteFinalizerName)
-		c.updateGCPMachineClassFinalizers(clone, finalizers.List())
+		return c.updateGCPMachineClassFinalizers(clone, finalizers.List())
 	}
+	return nil
 }
 
-func (c *controller) updateGCPMachineClassFinalizers(class *v1alpha1.GCPMachineClass, finalizers []string) {
+func (c *controller) updateGCPMachineClassFinalizers(class *v1alpha1.GCPMachineClass, finalizers []string) error {
 	// Get the latest version of the class so that we can avoid conflicts
 	class, err := c.controlMachineClient.GCPMachineClasses(class.Namespace).Get(class.Name, metav1.GetOptions{})
 	if err != nil {
-		return
+		return err
 	}
 
 	clone := class.DeepCopy()
 	clone.Finalizers = finalizers
 	_, err = c.controlMachineClient.GCPMachineClasses(class.Namespace).Update(clone)
 	if err != nil {
-		// Keep retrying until update goes through
-		glog.Warning("Updated failed, retrying: ", err)
-		c.updateGCPMachineClassFinalizers(class, finalizers)
+		klog.Warning("Updating GCPMachineClass failed, retrying. ", class.Name, err)
+		return err
 	}
+	klog.V(3).Infof("Successfully added/removed finalizer on the gcpmachineclass %q", class.Name)
+	return err
+}
+
+func (c *controller) enqueueGCPMachineClassAfter(obj interface{}, after time.Duration) {
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		return
+	}
+	c.gcpMachineClassQueue.AddAfter(key, after)
 }

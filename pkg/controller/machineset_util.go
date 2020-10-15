@@ -25,9 +25,10 @@ package controller
 import (
 	"fmt"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
 	labelsutil "github.com/gardener/machine-controller-manager/pkg/util/labels"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	errorsutil "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/util/retry"
 
@@ -62,7 +63,7 @@ func UpdateISWithRetries(isClient v1alpha1client.MachineSetInterface, isLister v
 
 	// Ignore the precondition violated error, but the RS isn't updated.
 	if retryErr == errorsutil.ErrPreconditionViolated {
-		glog.V(4).Infof("Machine set %s precondition doesn't hold, skip updating it.", name)
+		klog.V(4).Infof("Machine set %s precondition doesn't hold, skip updating it.", name)
 		retryErr = nil
 	}
 
@@ -74,4 +75,126 @@ func GetMachineSetHash(is *v1alpha1.MachineSet, uniquifier *int32) (string, erro
 	isTemplate := is.Spec.Template.DeepCopy()
 	isTemplate.Labels = labelsutil.CloneAndRemoveLabel(isTemplate.Labels, v1alpha1.DefaultMachineDeploymentUniqueLabelKey)
 	return fmt.Sprintf("%d", ComputeHash(isTemplate, uniquifier)), nil
+}
+
+// syncMachinesNodeTemplates updates all machines in the given machineList with the new nodeTemplate if required.
+func (c *controller) syncMachinesNodeTemplates(machineList []*v1alpha1.Machine, machineSet *v1alpha1.MachineSet) error {
+
+	controlClient := c.controlMachineClient
+	machineLister := c.machineLister
+
+	for _, machine := range machineList {
+		// Ignore inactive Machines.
+		if !IsMachineActive(machine) {
+			continue
+		}
+
+		nodeTemplateChanged := copyMachineSetNodeTemplatesToMachines(machineSet, machine)
+		// Only sync the machine that doesn't already have the latest nodeTemplate.
+		if nodeTemplateChanged {
+			_, err := UpdateMachineWithRetries(controlClient.Machines(machine.Namespace), machineLister, machine.Namespace, machine.Name,
+				func(machineToUpdate *v1alpha1.Machine) error {
+					return nil
+				})
+			if err != nil {
+				return fmt.Errorf("error in updating nodeTemplateSpec to machine %q: %v", machine.Name, err)
+			}
+			klog.V(2).Infof("Updated machine %s/%s of MachineSet %s/%s with latest nodeTemplate.", machine.Namespace, machine.Name, machineSet.Namespace, machineSet.Name)
+		}
+	}
+	return nil
+}
+
+// syncMachinesClassKind updates all machines in the given machineList with the new classKind if required.
+func (c *controller) syncMachinesClassKind(machineList []*v1alpha1.Machine, machineSet *v1alpha1.MachineSet) error {
+
+	controlClient := c.controlMachineClient
+	machineLister := c.machineLister
+
+	for _, machine := range machineList {
+		classKindChanged := copyMachineSetClassKindToMachines(machineSet, machine)
+		// Only sync the machine that doesn't already have the matching classKind.
+		if classKindChanged {
+			_, err := UpdateMachineWithRetries(controlClient.Machines(machine.Namespace), machineLister, machine.Namespace, machine.Name,
+				func(machineToUpdate *v1alpha1.Machine) error {
+					return nil
+				})
+			if err != nil {
+				return fmt.Errorf("error in updating classKind to machine %q: %v", machine.Name, err)
+			}
+			klog.V(2).Infof("Updated Machine %s/%s of MachineSet %s/%s with latest classKind.", machine.Namespace, machine.Name, machineSet.Namespace, machineSet.Name)
+		}
+	}
+	return nil
+}
+
+// copyMachineSetNodeTemplatesToMachines copies machineset's nodeTemplate to machine's nodeTemplate,
+// and returns true if machine's nodeTemplate is changed.
+// Note that apply and revision nodeTemplates are not copied.
+func copyMachineSetNodeTemplatesToMachines(machineset *v1alpha1.MachineSet, machine *v1alpha1.Machine) bool {
+	machineSetNodeTemplateCopy := machineset.Spec.Template.Spec.NodeTemplateSpec.DeepCopy()
+	machineNodeTemplateCopy := machine.Spec.NodeTemplateSpec.DeepCopy()
+
+	isNodeTemplateChanged := !(apiequality.Semantic.DeepEqual(machineSetNodeTemplateCopy, machineNodeTemplateCopy))
+
+	if isNodeTemplateChanged {
+		machine.Spec.NodeTemplateSpec = machineset.Spec.Template.Spec.NodeTemplateSpec
+	}
+	return isNodeTemplateChanged
+}
+
+// syncMachinesConfig updates all machines in the given machineList with the new config if required.
+func (c *controller) syncMachinesConfig(machineList []*v1alpha1.Machine, machineSet *v1alpha1.MachineSet) error {
+
+	controlClient := c.controlMachineClient
+	machineLister := c.machineLister
+
+	for _, machine := range machineList {
+		// Ignore inactive Machines.
+		if !IsMachineActive(machine) {
+			continue
+		}
+
+		configChanged := copyMachineSetConfigToMachines(machineSet, machine)
+		// Only sync the machine that doesn't already have the latest config.
+		if configChanged {
+			_, err := UpdateMachineWithRetries(controlClient.Machines(machine.Namespace), machineLister, machine.Namespace, machine.Name,
+				func(machineToUpdate *v1alpha1.Machine) error {
+					return nil
+				})
+			if err != nil {
+				return fmt.Errorf("error in updating MachineConfig to machine %q: %v", machine.Name, err)
+			}
+			klog.V(2).Infof("Updated machine %s/%s of MachineSet %s/%s with latest config.", machine.Namespace, machine.Name, machineSet.Namespace, machineSet.Name)
+		}
+	}
+	return nil
+}
+
+// copyMachineSetConfigToMachines copies machineset's config to machine's config,
+// and returns true if machine's config is changed.
+// Note that apply and revision config are not copied.
+func copyMachineSetConfigToMachines(machineset *v1alpha1.MachineSet, machine *v1alpha1.Machine) bool {
+	isConfigChanged := false
+
+	machineSetConfigCopy := machineset.Spec.Template.Spec.MachineConfiguration.DeepCopy()
+	machineConfigCopy := machine.Spec.MachineConfiguration.DeepCopy()
+
+	isConfigChanged = !(apiequality.Semantic.DeepEqual(machineSetConfigCopy, machineConfigCopy))
+
+	if isConfigChanged {
+		machine.Spec.MachineConfiguration = machineset.Spec.Template.Spec.MachineConfiguration
+	}
+	return isConfigChanged
+}
+
+// copyMachineSetClassKindToMachines copies machineset's class.Kind to machine's class.Kind,
+// and returns true if machine's class.Kind is changed.
+func copyMachineSetClassKindToMachines(machineset *v1alpha1.MachineSet, machine *v1alpha1.Machine) bool {
+	if machineset.Spec.Template.Spec.Class.Kind != machine.Spec.Class.Kind {
+		machine.Spec.Class.Kind = machineset.Spec.Template.Spec.Class.Kind
+		return true
+	}
+
+	return false
 }

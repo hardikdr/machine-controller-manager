@@ -22,7 +22,7 @@
 Using the existing [Kubeconfig](https://kubernetes.io/docs/tasks/access-application-cluster/authenticate-across-clusters-kubeconfig/), open another Terminal panel/window with the `KUBECONFIG` environment variable pointing to this Kubeconfig file as shown below,
 
 ```bash
-$ export KUBECONFIG=$GOPATH/src/github.com/gardener/machine-controller-manager/dev/kubeconfig.yaml
+$ export KUBECONFIG=<PATH_TO_REPO>/dev/kubeconfig.yaml
 ```
 
 ## Replace provider credentials and desired VM configurations
@@ -63,8 +63,8 @@ Get to know the current cluster state using the following commands,
 
 ```bash
 $ kubectl get awsmachineclass
-NAME       KIND
-test-aws   AWSMachineClass.v1alpha1.machine.sapcloud.io
+NAME       MACHINE TYPE   AMI          AGE
+test-aws   t2.large       ami-123456   5m
 ```
 
 - Checking kubernetes secrets in the cluster

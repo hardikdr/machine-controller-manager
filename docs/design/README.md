@@ -43,14 +43,3 @@ Machine Controller Manager is made up of 3 sub-controllers as of now. They are -
 1. Machine Safety Controller: A safety net controller that terminates orphan VMs and freezes machineSet/machineDeployment objects which are overshooting or timing out while trying to join nodes to the cluster.
 
 All these controllers work in an co-operative manner. They form a parent-child relationship with Machine Deployment Controller being the grandparent, Machine Set Controller being the parent, and Machine Controller being the child.
-
-## Future Plans
-The following is a short list of future plans,
-1. **Integrate the cluster-autoscaler** to act upon machine-deployment objects, used to manage the required number of machines based on the load of the cluster.
-2. **Support other cloud providers** like OpenStack.
-3. Integrate a garbage collector to terminate any orphan VMs.
-4. Build a comprehensive testing framework.
-5. Fix bugs that exist in the current implementation.
-
-### Todos Doc
-[This link](https://docs.google.com/document/d/10ruoL6VLVOEG2htYluY5T0-qvijXkw0Do_qE0tmexos/edit?usp=sharing) contains the working doc for the todos which are planned in the near future.

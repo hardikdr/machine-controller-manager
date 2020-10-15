@@ -14,6 +14,12 @@ this document. Few of answers assumes that the MCM is being used in conjuction w
 
 * [How to?](#how-to)
   * [How to install the MCM in a Kubernetes cluster?](#How-to-install-the-MCM-in-a-Kubernetes-cluster)
+  * [Why is my machine deleted ?](#Why-is-my-machine-deleted)
+  * [What are different sub-controllers in MCM ?](#What-are-different-sub-controllers-in-MCM)
+  * [What is safety-controller in MCM ?](#What-is-safety-controller-in-MCM)
+
+* [How to?](#how-to)
+  * [How to install the MCM in a kubernetes cluster?](#How-to-install-the-MCM-in-a-kubernetes-cluster)
   * [How to better control the roll-out process of the worker-nodes?](#How-to-better-control-the-roll-out-process-of-the-worker-nodes)
   * [How to scale-down the machine-deployment by selectively deleting the machines?](#How-to-scale-down-the-machine-deployment-by-selectively-deleting-the-machines)
   * [How to force-delete the machine?](#How-to-force-delete-the-machine)
@@ -59,7 +65,16 @@ Machine Controller Manager is made up of 3 sub-controllers as of now. They are -
 
 All these controllers work in an co-operative manner. They form a parent-child relationship with Machine Deployment Controller being the grandparent, Machine Set Controller being the parent, and Machine Controller being the child.
 
-### What is safety-controller in MCM?
+### What are different sub-controllers in MCM ?
+
+MCM mainly contains following sub-controllers:
+
+* Machine-deployment controller, responsible for reconciling the `MachineDeployment` object. It manages the lifecycle of the machine-set objects.
+* Machine-set controller, responsible for reconciling the `MachineSet` object. It manages the lifecycle of the machine objects.
+* Machine-controller, responsible for reconciling the `Machine` object. This controller manages the lifecycle of the actual VMs/machines created in cloud/on-prem. This controller has been moved out of tree, please refer an AWS machine-controller for more info- [link](https://github.com/gardener/machine-controller-manager-provider-gcp).
+* Safety-controller, responsible for handling the unidentified/unknown behaviors from the cloud-providers. Please read more about it functionality [below](#what-is-safety-controller).
+
+### What is safety-controller in MCM ?
 
 Safety-controller contains following functions:
 
@@ -136,6 +151,7 @@ A machine's lifecycle is governed by mainly following timeouts, which can be con
 ### How is the drain of the machine implemented?
 
 MCM imports the functionality from the upstream Kubernetes-drain library. Although, few parts have been modified to make it work best in the context of MCM. Drain is executed before machine-deletion, for gracefully migrate the applications. 
+
 Drain internally uses the `EvictionAPI` to evict the pods, and later triggers the `Deletion` of pods after `MachineDrainTimeout`. Please note:
 
 * Stateless pods are evicted are in parallel.
@@ -203,6 +219,7 @@ It could possibly be debugged with following steps:
 ### How should I test my code before submitting a PR?
 
 You can locally setup the MCM using following [guide](https://github.com/gardener/machine-controller-manager/blob/master/docs/development/local_setup.md). You must also enhance the unit tests related to your changes. You can locally run the unit tests by executing:
+
 ```
 ginkgo --cover pkg/controller/.
 ```
@@ -244,6 +261,7 @@ All of the knobs of MCM can be configured by the `workers` [section](https://git
 Shoot resource allows to spread the worker-pool across multiple zones using the field `workers.zones`, refer [link](https://github.com/gardener/gardener/blob/master/example/90-shoot.yaml#L115).
 
 * Gardener creates one `machineDeployment` per zone. Each machine deployment is initiated with the following replica:
+
 ```
 MachineDeployment.Spec.Replicas = (Workers.Minimum)/(Number of availibility zones)
 ```

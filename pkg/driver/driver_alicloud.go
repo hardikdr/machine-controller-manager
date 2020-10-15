@@ -21,18 +21,24 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
-	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/klog"
 
-	v1alpha1 "github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
+	"github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
 	"github.com/gardener/machine-controller-manager/pkg/metrics"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/utils"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
+)
+
+const (
+	// alicloudDriverName is the name of the CSI driver for Alibaba Cloud
+	alicloudDriverName = "diskplugin.csi.alibabacloud.com"
 )
 
 // AlicloudDriver is the driver struct for holding Alicloud machine information
@@ -75,6 +81,11 @@ func (c *AlicloudDriver) Create() (string, string, error) {
 		request.InternetMaxBandwidthOut = requests.NewInteger(*c.AlicloudMachineClass.Spec.InternetMaxBandwidthOut)
 	}
 
+	if c.AlicloudMachineClass.Spec.DataDisks != nil && len(c.AlicloudMachineClass.Spec.DataDisks) > 0 {
+		dataDiskRequests := c.generateDataDiskRequests(c.AlicloudMachineClass.Spec.DataDisks)
+		request.DataDisk = &dataDiskRequests
+	}
+
 	if c.AlicloudMachineClass.Spec.SystemDisk != nil {
 		request.SystemDiskCategory = c.AlicloudMachineClass.Spec.SystemDisk.Category
 		request.SystemDiskSize = fmt.Sprintf("%d", c.AlicloudMachineClass.Spec.SystemDisk.Size)
@@ -106,14 +117,41 @@ func (c *AlicloudDriver) Create() (string, string, error) {
 	return machineID, strings.ToLower(c.idToName(instanceID)), nil
 }
 
+func (c *AlicloudDriver) generateDataDiskRequests(disks []v1alpha1.AlicloudDataDisk) []ecs.RunInstancesDataDisk {
+	var dataDiskRequests []ecs.RunInstancesDataDisk
+	for _, disk := range disks {
+
+		dataDiskRequest := ecs.RunInstancesDataDisk{
+			Category:    disk.Category,
+			Encrypted:   strconv.FormatBool(disk.Encrypted),
+			DiskName:    fmt.Sprintf("%s-%s-data-disk", c.MachineName, disk.Name),
+			Description: disk.Description,
+			Size:        fmt.Sprintf("%d", disk.Size),
+		}
+
+		if disk.DeleteWithInstance != nil {
+			dataDiskRequest.DeleteWithInstance = strconv.FormatBool(*disk.DeleteWithInstance)
+		} else {
+			dataDiskRequest.DeleteWithInstance = strconv.FormatBool(true)
+		}
+
+		if disk.Category == "DiskEphemeralSSD" {
+			dataDiskRequest.DeleteWithInstance = ""
+		}
+
+		dataDiskRequests = append(dataDiskRequests, dataDiskRequest)
+	}
+	return dataDiskRequests
+}
+
 // Delete method is used to delete an alicloud machine
-func (c *AlicloudDriver) Delete() error {
-	result, err := c.getVMDetails(c.MachineID)
+func (c *AlicloudDriver) Delete(machineID string) error {
+	result, err := c.getVMDetails(machineID)
 	if err != nil {
 		return err
 	} else if len(result) == 0 {
 		// No running instance exists with the given machineID
-		glog.V(2).Infof("No VM matching the machineID found on the provider %q", c.MachineID)
+		klog.V(2).Infof("No VM matching the machineID found on the provider %q", machineID)
 		return nil
 	}
 
@@ -121,29 +159,14 @@ func (c *AlicloudDriver) Delete() error {
 		return errors.New("ec2 instance not in running/stopped state")
 	}
 
-	machineID := c.decodeMachineID(c.MachineID)
+	instanceID := c.decodeMachineID(machineID)
 
 	client, err := c.getEcsClient()
 	if err != nil {
 		return err
 	}
 
-	err = c.deleteInstance(client, machineID)
-	return err
-}
-
-func (c *AlicloudDriver) stopInstance(client *ecs.Client, machineID string) error {
-	request := ecs.CreateStopInstanceRequest()
-	request.InstanceId = machineID
-	request.ConfirmStop = requests.NewBoolean(true)
-	request.ForceStop = requests.NewBoolean(true)
-
-	_, err := client.StopInstance(request)
-	if err != nil {
-		metrics.APIFailedRequestCount.With(prometheus.Labels{"provider": "alicloud", "service": "ecs"}).Inc()
-	}
-	metrics.APIRequestCount.With(prometheus.Labels{"provider": "alicloud", "service": "ecs"}).Inc()
-
+	err = c.deleteInstance(client, instanceID)
 	return err
 }
 
@@ -285,4 +308,30 @@ func (c *AlicloudDriver) toInstanceTags(tags map[string]string) ([]ecs.RunInstan
 	}
 
 	return result, nil
+}
+
+// GetVolNames parses volume names from pv specs
+func (c *AlicloudDriver) GetVolNames(specs []corev1.PersistentVolumeSpec) ([]string, error) {
+	names := []string{}
+	for i := range specs {
+		spec := &specs[i]
+		if spec.FlexVolume != nil && spec.FlexVolume.Options != nil {
+			if name, ok := spec.FlexVolume.Options["volumeId"]; ok {
+				names = append(names, name)
+			}
+		} else if spec.CSI != nil && spec.CSI.Driver == alicloudDriverName && spec.CSI.VolumeHandle != "" {
+			names = append(names, spec.CSI.VolumeHandle)
+		}
+	}
+	return names, nil
+}
+
+//GetUserData return the used data whit which the VM will be booted
+func (c *AlicloudDriver) GetUserData() string {
+	return c.UserData
+}
+
+//SetUserData set the used data whit which the VM will be booted
+func (c *AlicloudDriver) SetUserData(userData string) {
+	c.UserData = userData
 }

@@ -20,13 +20,22 @@ CONTROL_NAMESPACE  := default
 CONTROL_KUBECONFIG := dev/target-kubeconfig.yaml
 TARGET_KUBECONFIG  := dev/target-kubeconfig.yaml
 
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN=$(shell go env GOPATH)/bin
+else
+GOBIN=$(shell go env GOBIN)
+endif
+
 #########################################
 # Rules for local development scenarios #
 #########################################
 
 .PHONY: start
 start:
-	@go run cmd/machine-controller-manager/controller_manager.go \
+	@GO111MODULE=on go run \
+			-mod=vendor \
+			cmd/machine-controller-manager/controller_manager.go \
 			--control-kubeconfig=$(CONTROL_KUBECONFIG) \
 			--target-kubeconfig=$(TARGET_KUBECONFIG) \
 			--namespace=$(CONTROL_NAMESPACE) \
@@ -34,12 +43,13 @@ start:
 			--safety-down=1 \
 			--machine-creation-timeout=20m \
 			--machine-drain-timeout=5m \
+			--machine-pv-detach-timeout=2m \
 			--machine-health-timeout=10m \
 			--machine-safety-apiserver-statuscheck-timeout=30s \
 			--machine-safety-apiserver-statuscheck-period=1m \
 			--machine-safety-orphan-vms-period=30m \
 			--machine-safety-overshooting-period=1m \
-			--v=2
+			--v=3
 
 #################################################################
 # Rules related to binary build, Docker image build and release #
@@ -47,7 +57,8 @@ start:
 
 .PHONY: revendor
 revendor:
-	@dep ensure -update
+	@GO111MODULE=on go mod vendor
+	@GO111MODULE=on go mod tidy
 
 .PHONY: build
 build:
@@ -62,7 +73,6 @@ release: build build-local docker-image docker-login docker-push rename-binaries
 
 .PHONY: docker-image
 docker-images:
-	@if [[ ! -f bin/rel/machine-controller-manager ]]; then echo "No binary found. Please run 'make build'"; false; fi
 	@docker build -t $(IMAGE_REPOSITORY):$(IMAGE_TAG) --rm .
 
 .PHONY: docker-login
@@ -117,3 +127,25 @@ show-coverage:
 test-clean:
 	@find . -name "*.coverprofile" -type f -delete
 	@rm -f $(COVERPROFILE)
+
+generate: controller-gen
+	$(CONTROLLER_GEN) crd paths=./pkg/apis/machine/v1alpha1... output:crd:dir=kubernetes/crds output:stdout
+	@./hack/generate-code
+
+# find or download controller-gen
+# download controller-gen if necessary
+.PHONY: controller-gen
+controller-gen:
+ifeq (, $(shell which controller-gen))
+	@{ \
+	set -e ;\
+	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
+	cd $$CONTROLLER_GEN_TMP_DIR ;\
+	go mod init tmp ;\
+	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.3.0 ;\
+	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
+	}
+CONTROLLER_GEN=$(GOBIN)/controller-gen
+else
+CONTROLLER_GEN=$(shell which controller-gen)
+endif

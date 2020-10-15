@@ -14,6 +14,7 @@
 	- [Usage](#usage)
 
 <!-- /TOC -->
+
 Conceptionally, the Machine Controller Manager is designed to run in a container within a Pod inside a Kubernetes cluster. For development purposes, you can run the Machine Controller Manager as a Go process on your local machine. This process connects to your remote cluster to manage VMs for that cluster. That means that the Machine Controller Manager runs outside a Kubernetes cluster which requires providing a [Kubeconfig](https://kubernetes.io/docs/tasks/access-application-cluster/authenticate-across-clusters-kubeconfig/) in your local filesystem and point the Machine Controller Manager to it when running it (see below).
 
 Although the following installation instructions are for Mac OS X, similar alternate commands could be found for any Linux distribution.
@@ -26,19 +27,10 @@ Install the latest version of Golang (at least `v1.8.3` is required) by using [H
 $ brew install golang
 ```
 
-Make sure to set your `$GOPATH` environment variable properly (conventionally, it points to `$HOME/go`).
-
-For your convenience, you can add the `bin` directory of the `$GOPATH` to your `$PATH`: `PATH=$PATH:$GOPATH/bin`, but it is not necessarily required.
-
 In order to perform linting on the Go source code, install [Golint](https://github.com/golang/lint):
 
 ```bash
-$ go get -u github.com/golang/lint/golint
-```
-
-[Dep](https://github.com/golang/dep) is used for managing Golang package dependencies. Install it:
-```bash
-$ brew install dep
+$ go get -u golang.org/x/lint/golint
 ```
 
 ## Installing `Docker` (Optional)
@@ -57,11 +49,9 @@ Create a Docker hub account at [Docker Hub](https://hub.docker.com/) if you don'
 The development of the Machine Controller Manager could happen by targetting any cluster. You basically need a Kubernetes cluster running on a set of machines. You just need the [Kubeconfig](https://kubernetes.io/docs/tasks/access-application-cluster/authenticate-across-clusters-kubeconfig/) file with the required access permissions attached to it.
 
 ### Installing the Machine Controller Manager locally
-Clone the repository from GitHub into your `$GOPATH`.
+Clone the repository from GitHub.
 
 ```bash
-$ mkdir -p $GOPATH/src/github.com/gardener
-$ cd $GOPATH/src/github.com/gardener
 $ git clone git@github.com:gardener/machine-controller-manager.git
 $ cd machine-controller-manager
 ```
@@ -87,16 +77,18 @@ I1227 11:08:19.963638   55523 controllermanager.go:204] Starting shared informer
 I1227 11:08:20.766085   55523 controller.go:247] Starting machine-controller-manager
 ```
 
+:warning: The file `dev/target-kubeconfig.yaml` points to the cluster whose nodes you want to manage. `dev/control-kubeconfig.yaml` points to the cluster from where you want to manage the nodes from. However, `dev/control-kubeconfig.yaml` is optional.
+
 The Machine Controller Manager should now be ready to manage the VMs in your kubernetes cluster.
 
-:warning: The file `dev/target-kubeconfig.yaml` points to the cluster whose nodes you want to manage. `dev/control-kubeconfig.yaml` points to the cluster from where you want to manage the nodes from. However, `dev/control-kubeconfig.yaml` is optional.
+:warning: This is assuming that your MCM is built to manage machines for any in-tree supported providers. There is a new way to deploy and manage out of tree (external) support for providers whose development can be [found here](cp_support_new.md)
 
 ## Testing Machine Classes
 
 To test the creation/deletion of a single instance for one particular machine class you can use the `managevm` cli. The corresponding `INFRASTRUCTURE-machine-class.yaml` and the `INFRASTRUCTURE-secret.yaml` need to be defined upfront. To build and run it
 
 ```bash
-go build -o managevm cmd/machine-controller-manager-cli/main.go
+GO111MODULE=on go build -mod=vendor -o managevm cmd/machine-controller-manager-cli/main.go
 # create machine
 ./managevm --secret PATH_TO/INFRASTRUCTURE-secret.yaml --machineclass PATH_TO/INFRASTRUCTURE-machine-class.yaml --classkind INFRASTRUCTURE --machinename test
 # delete machine

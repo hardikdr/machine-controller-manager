@@ -70,6 +70,7 @@ var _ = Describe("deployment_rollback", func() {
 			map[string]string{
 				PreferNoScheduleKey: "True",
 			},
+			nil,
 		)
 
 		DescribeTable("##table",
@@ -117,7 +118,7 @@ var _ = Describe("deployment_rollback", func() {
 				for _, expectedNode := range data.expect.nodes {
 					actualNode, err := controller.targetCoreClient.CoreV1().Nodes().Get(expectedNode.Name, metav1.GetOptions{})
 					Expect(err).ToNot(HaveOccurred())
-					Expect(actualNode.Spec.Taints).Should(Equal(expectedNode.Spec.Taints))
+					Expect(actualNode.Spec.Taints).Should(ConsistOf(expectedNode.Spec.Taints))
 				}
 
 			},
@@ -130,12 +131,14 @@ var _ = Describe("deployment_rollback", func() {
 						&machinev1.MachineStatus{
 							Node: "node",
 						},
+						nil,
+						nil,
 					),
 					nodes: newNodes(
 						1,
 						&corev1.NodeSpec{
 							Taints: []corev1.Taint{
-								corev1.Taint{
+								{
 									Key:    PreferNoScheduleKey,
 									Value:  "True",
 									Effect: "PreferNoSchedule",
@@ -163,6 +166,7 @@ var _ = Describe("deployment_rollback", func() {
 					map[string]string{
 						PreferNoScheduleKey: "True",
 					},
+					nil,
 				)[0],
 				expect: expect{
 					machineSets: newMachineSets(
@@ -181,6 +185,7 @@ var _ = Describe("deployment_rollback", func() {
 						nil,
 						nil,
 						map[string]string{},
+						nil,
 					),
 					nodes: newNodes(
 						1,

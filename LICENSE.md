@@ -217,10 +217,10 @@ https://github.com/go-openapi/spec.
 Copyright 2015 go-swagger maintainers.  
 Apache 2 license (https://github.com/go-openapi/spec/blob/master/LICENSE ).  
 
-Glog.  
-https://github.com/golang/glog.  
+klog.  
+https://github.com/golang/klog.  
 Copyright 2013 Google Inc. All Rights Reserved.  
-Apache 2 license (https://github.com/golang/glog/blob/master/LICENSE ).  
+Apache 2 license (https://github.com/kubernetes/klog/blob/master/LICENSE ).  
 
 Prometheus Go Client Library.  
 https://github.com/prometheus/client_golang.  
@@ -298,6 +298,12 @@ MIT license (https://github.com/onsi/gomega/blob/master/LICENSE)
 Alibaba Cloud Go Software Development Kit.  
 https://github.com/aliyun/alibaba-cloud-sdk-go.  
 Apache 2 license (https://github.com/aliyun/alibaba-cloud-sdk-go/blob/master/LICENSE)  
+
+gRPC-Go.  
+https://github.com/grpc/grpc-go.  
+Copyright 2017 gRPC authors.  
+Apache 2 license (https://github.com/grpc/grpc-go/blob/master/LICENSE)  
+
 
 ------
 ## BSD 3-clause "New" or "Revised" License

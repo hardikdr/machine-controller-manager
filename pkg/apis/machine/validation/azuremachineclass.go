@@ -18,19 +18,14 @@ limitations under the License.
 package validation
 
 import (
-	/*"strconv"
+	"fmt"
 	"strings"
-	"regexp"
 
-	corev1 "k8s.io/api/core/v1"
-	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
-	*/
-	"strings"
-
-	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine"
+
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 // ValidateAzureMachineClass validates a AzureMachineClass and returns a list of errors.
@@ -97,22 +92,23 @@ func validateAzureProperties(properties machine.AzureVirtualMachineProperties, f
 		allErrs = append(allErrs, field.Required(fldPath.Child("hardwareProfile.vmSize"), "VMSize is required"))
 	}
 
-	if properties.StorageProfile.ImageReference.Publisher == "" {
-		allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.imageReference.publisher"), "Image publisher is required"))
-	}
-	if properties.StorageProfile.ImageReference.Offer == "" {
-		allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.imageReference.offer"), "Image offer is required"))
-	}
-	if properties.StorageProfile.ImageReference.Sku == "" {
-		allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.imageReference.sku"), "Image sku is required"))
-	}
-	if properties.StorageProfile.ImageReference.Version == "" {
-		allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.imageReference.version"), "Image version is required"))
+	imageRef := properties.StorageProfile.ImageReference
+	if ((imageRef.URN == nil || *imageRef.URN == "") && imageRef.ID == "") ||
+		(imageRef.URN != nil && *imageRef.URN != "" && imageRef.ID != "") {
+		allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.imageReference"), "must specify either a image id or an urn"))
+	} else if imageRef.URN != nil && *imageRef.URN != "" {
+		splits := strings.Split(*imageRef.URN, ":")
+		if len(splits) != 4 {
+			allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.imageReference.urn"), "Invalid urn format"))
+		} else {
+			for _, s := range splits {
+				if len(s) == 0 {
+					allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.imageReference.urn"), "Invalid urn format, empty field"))
+				}
+			}
+		}
 	}
 
-	if properties.StorageProfile.OsDisk.Caching == "" {
-		allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.osDisk.caching"), "OSDisk caching is required"))
-	}
 	if properties.StorageProfile.OsDisk.DiskSizeGB <= 0 {
 		allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.osDisk.diskSizeGB"), "OSDisk size must be positive"))
 	}
@@ -120,8 +116,64 @@ func validateAzureProperties(properties machine.AzureVirtualMachineProperties, f
 		allErrs = append(allErrs, field.Required(fldPath.Child("storageProfile.osDisk.createOption"), "OSDisk create option is required"))
 	}
 
+	if properties.StorageProfile.DataDisks != nil {
+
+		if len(properties.StorageProfile.DataDisks) > 64 {
+			allErrs = append(allErrs, field.TooMany(fldPath.Child("storageProfile.dataDisks"), len(properties.StorageProfile.DataDisks), 64))
+		}
+
+		luns := map[int32]int{}
+		for i, dataDisk := range properties.StorageProfile.DataDisks {
+			idxPath := fldPath.Child("storageProfile.dataDisks").Index(i)
+
+			lun := dataDisk.Lun
+
+			if lun == nil {
+				allErrs = append(allErrs, field.Required(idxPath.Child("lun"), "DataDisk Lun is required"))
+			} else {
+				if *lun < 0 || *lun > 63 {
+					allErrs = append(allErrs, field.Invalid(idxPath.Child("lun"), *lun, utilvalidation.InclusiveRangeError(0, 63)))
+				}
+				if _, keyExist := luns[*lun]; keyExist {
+					luns[*lun]++
+				} else {
+					luns[*lun] = 1
+				}
+			}
+
+			if dataDisk.DiskSizeGB <= 0 {
+				allErrs = append(allErrs, field.Required(idxPath.Child("diskSizeGB"), "DataDisk size must be positive"))
+			}
+			if dataDisk.StorageAccountType == "" {
+				allErrs = append(allErrs, field.Required(idxPath.Child("storageAccountType"), "DataDisk storage account type is required"))
+			}
+		}
+
+		for lun, number := range luns {
+			if number > 1 {
+				allErrs = append(allErrs, field.Invalid(fldPath.Child("storageProfile.dataDisks"), lun, fmt.Sprintf("Data Disk Lun '%d' duplicated %d times, Lun must be unique", lun, number)))
+			}
+		}
+	}
 	if properties.OsProfile.AdminUsername == "" {
 		allErrs = append(allErrs, field.Required(fldPath.Child("osProfile.adminUsername"), "AdminUsername is required"))
+	}
+
+	if properties.Zone == nil && properties.MachineSet == nil && properties.AvailabilitySet == nil {
+		allErrs = append(allErrs, field.Forbidden(fldPath.Child("zone|.machineSet|.availabilitySet"), "Machine need to be assigned to a zone, a MachineSet or an AvailabilitySet"))
+	}
+
+	if properties.Zone != nil && (properties.MachineSet != nil || properties.AvailabilitySet != nil) {
+		allErrs = append(allErrs, field.Forbidden(fldPath.Child("zone|.machineSet|.availabilitySet"), "Machine cannot be assigned to a zone, a MachineSet and an AvailabilitySet in parallel"))
+	}
+
+	if properties.Zone == nil {
+		if properties.MachineSet != nil && properties.AvailabilitySet != nil {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Child("machineSet|.availabilitySet"), "Machine cannot be assigned a MachineSet and an AvailabilitySet in parallel"))
+		}
+		if properties.MachineSet != nil && !(properties.MachineSet.Kind == machine.MachineSetKindVMO || properties.MachineSet.Kind == machine.MachineSetKindAvailabilitySet) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("machineSet"), properties.MachineSet.Kind, fmt.Sprintf("Invalid MachineSet kind. Use either '%s' or '%s'", machine.MachineSetKindVMO, machine.MachineSetKindAvailabilitySet)))
+		}
 	}
 
 	/*

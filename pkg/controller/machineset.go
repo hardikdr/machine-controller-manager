@@ -36,9 +36,9 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/integer"
+	"k8s.io/utils/integer"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine"
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
@@ -64,7 +64,7 @@ func (c *controller) getMachineMachineSets(machine *v1alpha1.Machine) ([]*v1alph
 
 	if len(machine.Labels) == 0 {
 		err := errors.New("No MachineSets found for machine because it has no labels")
-		glog.V(4).Info(err, ": ", machine.Name)
+		klog.V(4).Info(err, ": ", machine.Name)
 		return nil, err
 	}
 
@@ -80,7 +80,7 @@ func (c *controller) getMachineMachineSets(machine *v1alpha1.Machine) ([]*v1alph
 		}
 		selector, err := metav1.LabelSelectorAsSelector(machineSet.Spec.Selector)
 		if err != nil {
-			glog.Errorf("Invalid selector: %v", err)
+			klog.Errorf("Invalid selector: %v", err)
 			return nil, err
 		}
 
@@ -89,12 +89,11 @@ func (c *controller) getMachineMachineSets(machine *v1alpha1.Machine) ([]*v1alph
 			continue
 		}
 		machineSets = append(machineSets, machineSet)
-		//glog.Info("D", len(machineSets))
 	}
 
 	if len(machineSets) == 0 {
 		err := errors.New("No MachineSets found for machine doesn't have matching labels")
-		glog.V(4).Info(err, ": ", machine.Name)
+		klog.V(4).Info(err, ": ", machine.Name)
 		return nil, err
 	}
 
@@ -140,7 +139,7 @@ func (c *controller) machineSetUpdate(old, cur interface{}) {
 	// that bad as MachineSets that haven't met expectations yet won't
 	// sync, and all the listing is done using local stores.
 	if oldMachineSet.Spec.Replicas != currentMachineSet.Spec.Replicas {
-		glog.V(4).Infof("%v updated. Desired machine count change: %d->%d", currentMachineSet.Name, oldMachineSet.Spec.Replicas, currentMachineSet.Spec.Replicas)
+		klog.V(4).Infof("%v updated. Desired machine count change: %d->%d", currentMachineSet.Name, oldMachineSet.Spec.Replicas, currentMachineSet.Spec.Replicas)
 	}
 	c.enqueueMachineSet(currentMachineSet)
 }
@@ -166,7 +165,7 @@ func (c *controller) addMachineToMachineSet(obj interface{}) {
 		if err != nil {
 			return
 		}
-		glog.V(4).Infof("Machine %s created: %#v.", machine.Name, machine)
+		klog.V(4).Infof("Machine %s created: %#v.", machine.Name, machine)
 		c.expectations.CreationObserved(machineSetKey)
 		c.enqueueMachineSet(machineSet)
 		return
@@ -183,7 +182,7 @@ func (c *controller) addMachineToMachineSet(obj interface{}) {
 		return
 	}
 
-	glog.V(4).Infof("Orphan Machine %s created: %#v.", machine.Name, machine)
+	klog.V(4).Infof("Orphan Machine %s created: %#v.", machine.Name, machine)
 	for _, machineSet := range machineSets {
 		c.enqueueMachineSet(machineSet)
 	}
@@ -232,7 +231,7 @@ func (c *controller) updateMachineToMachineSet(old, cur interface{}) {
 		if machineSet == nil {
 			return
 		}
-		glog.V(4).Infof("Machine %s updated, objectMeta %+v -> %+v.", curMachine.Name, oldMachine.ObjectMeta, curMachine.ObjectMeta)
+		klog.V(4).Infof("Machine %s updated, objectMeta %+v -> %+v.", curMachine.Name, oldMachine.ObjectMeta, curMachine.ObjectMeta)
 		c.enqueueMachineSet(machineSet)
 		return
 	}
@@ -246,7 +245,7 @@ func (c *controller) updateMachineToMachineSet(old, cur interface{}) {
 		} else if len(machineSets) == 0 {
 			return
 		}
-		glog.V(4).Infof("Orphan Machine %s updated, objectMeta %+v -> %+v.", curMachine.Name, oldMachine.ObjectMeta, curMachine.ObjectMeta)
+		klog.V(4).Infof("Orphan Machine %s updated, objectMeta %+v -> %+v.", curMachine.Name, oldMachine.ObjectMeta, curMachine.ObjectMeta)
 		for _, machineSet := range machineSets {
 			c.enqueueMachineSet(machineSet)
 		}
@@ -289,7 +288,7 @@ func (c *controller) deleteMachineToMachineSet(obj interface{}) {
 	if err != nil {
 		return
 	}
-	glog.V(4).Infof("Machine %s/%s deleted through %v, timestamp %+v: %#v.", machine.Namespace, machine.Name, utilruntime.GetCaller(), machine.DeletionTimestamp, machine)
+	klog.V(4).Infof("Machine %s/%s deleted through %v, timestamp %+v: %#v.", machine.Namespace, machine.Name, utilruntime.GetCaller(), machine.DeletionTimestamp, machine)
 	c.expectations.DeletionObserved(machineSetKey, MachineKey(machine))
 	c.enqueueMachineSet(machineSet)
 }
@@ -327,7 +326,7 @@ func (c *controller) manageReplicas(allMachines []*v1alpha1.Machine, machineSet 
 	var activeMachines, staleMachines []*v1alpha1.Machine
 	for _, machine := range allMachines {
 		if IsMachineActive(machine) {
-			//glog.Info("Active machine: ", machine.Name)
+			//klog.Info("Active machine: ", machine.Name)
 			activeMachines = append(activeMachines, machine)
 		} else if IsMachineFailed(machine) {
 			staleMachines = append(staleMachines, machine)
@@ -335,17 +334,17 @@ func (c *controller) manageReplicas(allMachines []*v1alpha1.Machine, machineSet 
 	}
 
 	if len(staleMachines) >= 1 {
-		glog.V(2).Infof("Deleting stale machines")
+		klog.V(2).Infof("Deleting stale machines")
 	}
 	c.terminateMachines(staleMachines, machineSet)
 
 	diff := len(activeMachines) - int(machineSet.Spec.Replicas)
-	glog.V(3).Infof("Difference between current active replicas and desired replicas - %d", diff)
+	klog.V(4).Infof("Difference between current active replicas and desired replicas - %d", diff)
 
 	if diff < 0 {
 		// If MachineSet is frozen and no deletion timestamp, don't process it
 		if machineSet.Labels["freeze"] == "True" && machineSet.DeletionTimestamp == nil {
-			glog.V(2).Infof("MachineSet %q is frozen, and hence not processing", machineSet.Name)
+			klog.V(2).Infof("MachineSet %q is frozen, and hence not processing", machineSet.Name)
 			return nil
 		}
 
@@ -359,7 +358,7 @@ func (c *controller) manageReplicas(allMachines []*v1alpha1.Machine, machineSet 
 		// into a performance bottleneck. We should generate a UID for the machine
 		// beforehand and store it via ExpectCreations.
 		c.expectations.ExpectCreations(machineSetKey, diff)
-		glog.V(2).Infof("Too few replicas for MachineSet %s, need %d, creating %d", machineSet.Name, (machineSet.Spec.Replicas), diff)
+		klog.V(2).Infof("Too few replicas for MachineSet %s, need %d, creating %d", machineSet.Name, (machineSet.Spec.Replicas), diff)
 		// Batch the machine creates. Batch sizes start at SlowStartInitialBatchSize
 		// and double with each successful iteration in a kind of "slow start".
 		// This handles attempts to start large numbers of machines that would
@@ -378,7 +377,6 @@ func (c *controller) manageReplicas(allMachines []*v1alpha1.Machine, machineSet 
 				BlockOwnerDeletion: boolPtr(true),
 				Controller:         boolPtr(true),
 			}
-			//glog.Info("Printing MachineSet details ... %v", &is)
 			err := c.machineControl.CreateMachinesWithControllerRef(machineSet.Namespace, &machineSet.Spec.Template, machineSet, controllerRef)
 			if err != nil && apierrors.IsTimeout(err) {
 				// Machine is created but its initialization has timed out.
@@ -392,13 +390,12 @@ func (c *controller) manageReplicas(allMachines []*v1alpha1.Machine, machineSet 
 			}
 			return err
 		})
-		//glog.Info("Stop Create:", diff)
 
 		// Any skipped machines that we never attempted to start shouldn't be expected.
 		// The skipped machines will be retried later. The next controller resync will
 		// retry the slow start process.
 		if skippedMachines := diff - successfulCreations; skippedMachines > 0 {
-			glog.V(2).Infof("Slow-start failure. Skipping creation of %d machines, decrementing expectations for %v %v/%v", skippedMachines, machineSet.Kind, machineSet.Namespace, machineSet.Name)
+			klog.V(2).Infof("Slow-start failure. Skipping creation of %d machines, decrementing expectations for %v %v/%v", skippedMachines, machineSet.Kind, machineSet.Namespace, machineSet.Name)
 			for i := 0; i < skippedMachines; i++ {
 				// Decrement the expected number of creates because the informer won't observe this machine
 				c.expectations.CreationObserved(machineSetKey)
@@ -409,7 +406,7 @@ func (c *controller) manageReplicas(allMachines []*v1alpha1.Machine, machineSet 
 		if diff > BurstReplicas {
 			diff = BurstReplicas
 		}
-		glog.V(2).Infof("Too many replicas for %v %s/%s, need %d, deleting %d", machineSet.Kind, machineSet.Namespace, machineSet.Name, (machineSet.Spec.Replicas), diff)
+		klog.V(2).Infof("Too many replicas for %v %s/%s, need %d, deleting %d", machineSet.Kind, machineSet.Namespace, machineSet.Name, (machineSet.Spec.Replicas), diff)
 
 		machinesToDelete := getMachinesToDelete(activeMachines, diff)
 
@@ -432,9 +429,9 @@ func (c *controller) manageReplicas(allMachines []*v1alpha1.Machine, machineSet 
 // invoked concurrently with the same key.
 func (c *controller) reconcileClusterMachineSet(key string) error {
 	startTime := time.Now()
-	glog.V(3).Infof("Start syncing %q", key)
+	klog.V(4).Infof("Start syncing machine set %q", key)
 	defer func() {
-		glog.V(3).Infof("Finished syncing %q (%v)", key, time.Since(startTime))
+		klog.V(4).Infof("Finished syncing machine set %q (%v)", key, time.Since(startTime))
 	}()
 
 	_, name, err := cache.SplitMetaNamespaceKey(key)
@@ -445,7 +442,7 @@ func (c *controller) reconcileClusterMachineSet(key string) error {
 	// Get the latest version of the machineSet so that we can avoid conflicts
 	machineSet, err := c.controlMachineClient.MachineSets(c.namespace).Get(name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		glog.V(4).Infof("%v has been deleted", key)
+		klog.V(4).Infof("%v has been deleted", key)
 		c.expectations.DeleteExpectations(key)
 		return nil
 	}
@@ -461,18 +458,12 @@ func (c *controller) reconcileClusterMachineSet(key string) error {
 	}
 	validationerr := validation.ValidateMachineSet(internalMachineSet)
 	if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-		glog.V(2).Infof("Validation of MachineSet failed %s", validationerr.ToAggregate().Error())
+		klog.V(2).Infof("Validation of MachineSet failed %s", validationerr.ToAggregate().Error())
 		return nil
 	}
 
-	// Validate MachineClass
-	_, secretRef, err := c.validateMachineClass(&machineSet.Spec.Template.Spec.Class)
-	if err != nil || secretRef == nil {
-		return err
-	}
-
-	// Manipulate finalizers
 	if machineSet.DeletionTimestamp == nil {
+		// Manipulate finalizers
 		c.addMachineSetFinalizers(machineSet)
 	}
 
@@ -497,6 +488,23 @@ func (c *controller) reconcileClusterMachineSet(key string) error {
 		return err
 	}
 
+	// syncMachinesNodeTemplates syncs the nodeTemplate with claimedMachines if any of the machine's nodeTemplate has changed.
+	err = c.syncMachinesNodeTemplates(filteredMachines, machineSet)
+	if err != nil {
+		return err
+	}
+
+	// syncMachinesConfig syncs the config with claimedMachines if any of the machine's config has changed.
+	err = c.syncMachinesConfig(filteredMachines, machineSet)
+	if err != nil {
+		return err
+	}
+	// syncMachinesClassKind syncs the classKind with claimedMachines if any of the machine's classKind has changed.
+	err = c.syncMachinesClassKind(filteredMachines, machineSet)
+	if err != nil {
+		return err
+	}
+
 	// TODO: Fix working of expectations to reflect correct behaviour
 	//machineSetNeedsSync := c.expectations.SatisfiedExpectations(key)
 	var manageReplicasErr error
@@ -515,7 +523,7 @@ func (c *controller) reconcileClusterMachineSet(key string) error {
 			c.deleteMachineSetFinalizers(machineSet)
 		} else if finalizers := sets.NewString(machineSet.Finalizers...); finalizers.Has(DeleteFinalizerName) {
 			// Trigger deletion of machines backing the machineSet
-			glog.V(4).Infof("Deleting all child machines as MachineSet %s has set deletionTimestamp", machineSet.Name)
+			klog.V(4).Infof("Deleting all child machines as MachineSet %s has set deletionTimestamp", machineSet.Name)
 			c.terminateMachines(filteredMachines, machineSet)
 		}
 	}
@@ -529,7 +537,7 @@ func (c *controller) reconcileClusterMachineSet(key string) error {
 		// Multiple things could lead to this update failing. Requeuing the machine set ensures
 		// Returning an error causes a requeue without forcing a hotloop
 		if !apierrors.IsNotFound(err) {
-			glog.Errorf("Update machineSet %s failed with: %s", machineSet.Name, err)
+			klog.Errorf("Update machineSet %s failed with: %s", machineSet.Name, err)
 		}
 		return err
 	}
@@ -573,6 +581,8 @@ func slowStartBatch(count int, initialBatchSize int, fn func() error) (int, erro
 	successes := 0
 	for batchSize := integer.IntMin(remaining, initialBatchSize); batchSize > 0; batchSize = integer.IntMin(2*batchSize, remaining) {
 		errCh := make(chan error, batchSize)
+		defer close(errCh)
+
 		var wg sync.WaitGroup
 		wg.Add(batchSize)
 		for i := 0; i < batchSize; i++ {
@@ -614,7 +624,7 @@ func getMachineKeys(machines []*v1alpha1.Machine) []string {
 	return machineKeys
 }
 
-func (c *controller) prepareMachineForDeletion(targetMachine *v1alpha1.Machine, machineSet *v1alpha1.MachineSet, wg *sync.WaitGroup, errCh *chan error) {
+func (c *controller) prepareMachineForDeletion(targetMachine *v1alpha1.Machine, machineSet *v1alpha1.MachineSet, wg *sync.WaitGroup, errCh chan<- error) {
 	defer wg.Done()
 
 	// Machine is already marked as 'to-be-deleted'
@@ -626,17 +636,14 @@ func (c *controller) prepareMachineForDeletion(targetMachine *v1alpha1.Machine, 
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Couldn't get key for %v %#v: %v", machineSet.Kind, machineSet, err))
 		return
-	} else if targetMachine.Status.CurrentStatus.Phase == "" {
-		// Machine is still not created properly
-		return
 	}
 
 	if err := c.machineControl.DeleteMachine(targetMachine.Namespace, targetMachine.Name, machineSet); err != nil {
 		// Decrement the expected number of deletes because the informer won't observe this deletion
 		machineKey := MachineKey(targetMachine)
-		glog.V(2).Infof("Failed to delete %v, decrementing expectations for %v %s/%s", machineKey, machineSet.Kind, machineSet.Namespace, machineSet.Name)
+		klog.V(2).Infof("Failed to delete %v, decrementing expectations for %v %s/%s", machineKey, machineSet.Kind, machineSet.Namespace, machineSet.Name)
 		c.expectations.DeletionObserved(machineSetKey, machineKey)
-		*errCh <- err
+		errCh <- err
 	}
 
 	// Force trigger deletion to reflect in machine status
@@ -652,7 +659,7 @@ func (c *controller) prepareMachineForDeletion(targetMachine *v1alpha1.Machine, 
 		LastUpdateTime: metav1.Now(),
 	}
 	c.updateMachineStatus(targetMachine, lastOperation, currentStatus)
-	glog.V(2).Infof("Delete machine from machineset %q", targetMachine.Name)
+	klog.V(2).Infof("Delete machine from machineset %q", targetMachine.Name)
 }
 
 func (c *controller) terminateMachines(inactiveMachines []*v1alpha1.Machine, machineSet *v1alpha1.MachineSet) error {
@@ -661,10 +668,11 @@ func (c *controller) terminateMachines(inactiveMachines []*v1alpha1.Machine, mac
 		numOfInactiveMachines = len(inactiveMachines)
 		errCh                 = make(chan error, numOfInactiveMachines)
 	)
-	wg.Add(numOfInactiveMachines)
+	defer close(errCh)
 
+	wg.Add(numOfInactiveMachines)
 	for _, machine := range inactiveMachines {
-		go c.prepareMachineForDeletion(machine, machineSet, &wg, &errCh)
+		go c.prepareMachineForDeletion(machine, machineSet, &wg, errCh)
 	}
 	wg.Wait()
 
@@ -715,7 +723,7 @@ func (c *controller) updateMachineSetFinalizers(machineSet *v1alpha1.MachineSet,
 	_, err = c.controlMachineClient.MachineSets(clone.Namespace).Update(clone)
 	if err != nil {
 		// Keep retrying until update goes through
-		glog.Warning("Updated failed, retrying")
+		klog.Warning("Updated failed, retrying")
 		c.updateMachineSetFinalizers(machineSet, finalizers)
 	}
 }

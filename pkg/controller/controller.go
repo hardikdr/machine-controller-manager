@@ -22,35 +22,32 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
-
-	machine_internal "github.com/gardener/machine-controller-manager/pkg/apis/machine"
-	machine_v1 "github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
+	machineinternal "github.com/gardener/machine-controller-manager/pkg/apis/machine"
+	machinev1alpha1 "github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
+	machinescheme "github.com/gardener/machine-controller-manager/pkg/client/clientset/versioned/scheme"
 	machineapi "github.com/gardener/machine-controller-manager/pkg/client/clientset/versioned/typed/machine/v1alpha1"
 	machineinformers "github.com/gardener/machine-controller-manager/pkg/client/informers/externalversions/machine/v1alpha1"
 	machinelisters "github.com/gardener/machine-controller-manager/pkg/client/listers/machine/v1alpha1"
-	"github.com/golang/glog"
-	"github.com/prometheus/client_golang/prometheus"
-	"k8s.io/api/core/v1"
-	coreinformers "k8s.io/client-go/informers/core/v1"
-	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	corelisters "k8s.io/client-go/listers/core/v1"
-
-	machinescheme "github.com/gardener/machine-controller-manager/pkg/client/clientset/versioned/scheme"
 	"github.com/gardener/machine-controller-manager/pkg/handlers"
 	"github.com/gardener/machine-controller-manager/pkg/options"
+
+	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	runtimeutil "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog"
 )
 
 const (
-	maxRetries                = 15
-	pollingStartInterval      = 1 * time.Second
-	pollingMaxBackoffDuration = 1 * time.Hour
+	maxRetries = 15
 
 	// ClassAnnotation is the annotation used to identify a machine class
 	ClassAnnotation = "machine.sapcloud.io/class"
@@ -66,6 +63,8 @@ func NewController(
 	controlMachineClient machineapi.MachineV1alpha1Interface,
 	controlCoreClient kubernetes.Interface,
 	targetCoreClient kubernetes.Interface,
+	pvcInformer coreinformers.PersistentVolumeClaimInformer,
+	pvInformer coreinformers.PersistentVolumeInformer,
 	secretInformer coreinformers.SecretInformer,
 	nodeInformer coreinformers.NodeInformer,
 	openStackMachineClassInformer machineinformers.OpenStackMachineClassInformer,
@@ -79,56 +78,66 @@ func NewController(
 	machineDeploymentInformer machineinformers.MachineDeploymentInformer,
 	recorder record.EventRecorder,
 	safetyOptions options.SafetyOptions,
+	nodeConditions string,
+	bootstrapTokenAuthExtraGroups string,
+	deleteMigratedMachineClass bool,
+	autoscalerScaleDownAnnotationDuringRollout bool,
 ) (Controller, error) {
 	controller := &controller{
-		namespace:                      namespace,
-		controlMachineClient:           controlMachineClient,
-		controlCoreClient:              controlCoreClient,
-		targetCoreClient:               targetCoreClient,
-		recorder:                       recorder,
-		expectations:                   NewUIDTrackingContExpectations(NewContExpectations()),
-		secretQueue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secret"),
-		nodeQueue:                      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "node"),
-		openStackMachineClassQueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "openstackmachineclass"),
-		awsMachineClassQueue:           workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "awsmachineclass"),
-		azureMachineClassQueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "azuremachineclass"),
-		gcpMachineClassQueue:           workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "gcpmachineclass"),
-		alicloudMachineClassQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "alicloudmachineclass"),
-		packetMachineClassQueue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "packetmachineclass"),
-		machineQueue:                   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machine"),
-		machineSetQueue:                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machineset"),
-		machineDeploymentQueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinedeployment"),
-		machineSafetyOrphanVMsQueue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyorphanvms"),
-		machineSafetyOvershootingQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyovershooting"),
-		machineSafetyAPIServerQueue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyapiserver"),
-		safetyOptions:                  safetyOptions,
+		namespace:                                  namespace,
+		controlMachineClient:                       controlMachineClient,
+		controlCoreClient:                          controlCoreClient,
+		targetCoreClient:                           targetCoreClient,
+		recorder:                                   recorder,
+		expectations:                               NewUIDTrackingContExpectations(NewContExpectations()),
+		secretQueue:                                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secret"),
+		nodeQueue:                                  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "node"),
+		openStackMachineClassQueue:                 workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "openstackmachineclass"),
+		awsMachineClassQueue:                       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "awsmachineclass"),
+		azureMachineClassQueue:                     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "azuremachineclass"),
+		gcpMachineClassQueue:                       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "gcpmachineclass"),
+		alicloudMachineClassQueue:                  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "alicloudmachineclass"),
+		packetMachineClassQueue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "packetmachineclass"),
+		machineQueue:                               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machine"),
+		machineSetQueue:                            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machineset"),
+		machineDeploymentQueue:                     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinedeployment"),
+		machineSafetyOrphanVMsQueue:                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyorphanvms"),
+		machineSafetyOvershootingQueue:             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyovershooting"),
+		machineSafetyAPIServerQueue:                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyapiserver"),
+		safetyOptions:                              safetyOptions,
+		nodeConditions:                             nodeConditions,
+		bootstrapTokenAuthExtraGroups:              bootstrapTokenAuthExtraGroups,
+		deleteMigratedMachineClass:                 deleteMigratedMachineClass,
+		autoscalerScaleDownAnnotationDuringRollout: autoscalerScaleDownAnnotationDuringRollout,
 	}
 
 	controller.internalExternalScheme = runtime.NewScheme()
 
-	if err := machine_internal.AddToScheme(controller.internalExternalScheme); err != nil {
+	if err := machineinternal.AddToScheme(controller.internalExternalScheme); err != nil {
 		return nil, err
 	}
 
-	if err := machine_v1.AddToScheme(controller.internalExternalScheme); err != nil {
+	if err := machinev1alpha1.AddToScheme(controller.internalExternalScheme); err != nil {
 		return nil, err
 	}
 
 	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(glog.Infof)
-	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(controlCoreClient.CoreV1().RESTClient()).Events(namespace)})
+	eventBroadcaster.StartLogging(klog.Infof)
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: typedcorev1.New(controlCoreClient.CoreV1().RESTClient()).Events(namespace)})
 
 	controller.machineControl = RealMachineControl{
 		controlMachineClient: controlMachineClient,
-		Recorder:             eventBroadcaster.NewRecorder(machinescheme.Scheme, v1.EventSource{Component: "machineset-controller"}),
+		Recorder:             eventBroadcaster.NewRecorder(machinescheme.Scheme, corev1.EventSource{Component: "machineset-controller"}),
 	}
 
 	controller.machineSetControl = RealMachineSetControl{
 		controlMachineClient: controlMachineClient,
-		Recorder:             eventBroadcaster.NewRecorder(machinescheme.Scheme, v1.EventSource{Component: "machinedeployment-controller"}),
+		Recorder:             eventBroadcaster.NewRecorder(machinescheme.Scheme, corev1.EventSource{Component: "machinedeployment-controller"}),
 	}
 
 	// Controller listers
+	controller.pvcLister = pvcInformer.Lister()
+	controller.pvLister = pvInformer.Lister()
 	controller.secretLister = secretInformer.Lister()
 	controller.openStackMachineClassLister = openStackMachineClassInformer.Lister()
 	controller.awsMachineClassLister = awsMachineClassInformer.Lister()
@@ -176,6 +185,12 @@ func NewController(
 		AddFunc:    controller.azureMachineClassToSecretAdd,
 		UpdateFunc: controller.azureMachineClassToSecretUpdate,
 		DeleteFunc: controller.azureMachineClassToSecretDelete,
+	})
+
+	alicloudMachineClassInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    controller.alicloudMachineClassToSecretAdd,
+		UpdateFunc: controller.alicloudMachineClassToSecretUpdate,
+		DeleteFunc: controller.alicloudMachineClassToSecretDelete,
 	})
 
 	awsMachineClassInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -372,11 +387,6 @@ func NewController(
 		DeleteFunc: controller.deleteMachineToSafety,
 	})
 
-	machineSetInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    controller.addMachineSetToSafety,
-		UpdateFunc: controller.updateMachineSetToSafety,
-	})
-
 	return controller, nil
 }
 
@@ -390,7 +400,11 @@ type Controller interface {
 
 // controller is a concrete Controller.
 type controller struct {
-	namespace string
+	namespace                                  string
+	nodeConditions                             string
+	bootstrapTokenAuthExtraGroups              string
+	deleteMigratedMachineClass                 bool
+	autoscalerScaleDownAnnotationDuringRollout bool
 
 	controlMachineClient machineapi.MachineV1alpha1Interface
 	controlCoreClient    kubernetes.Interface
@@ -404,6 +418,8 @@ type controller struct {
 
 	internalExternalScheme *runtime.Scheme
 	// listers
+	pvcLister                   corelisters.PersistentVolumeClaimLister
+	pvLister                    corelisters.PersistentVolumeLister
 	secretLister                corelisters.SecretLister
 	nodeLister                  corelisters.NodeLister
 	openStackMachineClassLister machinelisters.OpenStackMachineClassLister
@@ -471,8 +487,7 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) {
 		return
 	}
 
-	glog.V(1).Info("Starting machine-controller-manager")
-	handlers.UpdateHealth(true)
+	klog.V(1).Info("Starting machine-controller-manager")
 
 	// The controller implement the prometheus.Collector interface and can therefore
 	// be passed to the metrics registry. Collectors which added to the registry
@@ -498,7 +513,7 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) {
 	}
 
 	<-stopCh
-	glog.V(1).Info("Shutting down Machine Controller Manager ")
+	klog.V(1).Info("Shutting down Machine Controller Manager ")
 	handlers.UpdateHealth(false)
 
 	waitGroup.Wait()
@@ -540,12 +555,12 @@ func worker(queue workqueue.RateLimitingInterface, resourceType string, maxRetri
 				}
 
 				if queue.NumRequeues(key) < maxRetries {
-					glog.V(4).Infof("Error syncing %s %v: %v", resourceType, key, err)
+					klog.V(4).Infof("Error syncing %s %v: %v", resourceType, key, err)
 					queue.AddRateLimited(key)
 					return false
 				}
 
-				glog.V(4).Infof("Dropping %s %q out of the queue: %v", resourceType, key, err)
+				klog.V(4).Infof("Dropping %s %q out of the queue: %v", resourceType, key, err)
 				queue.Forget(key)
 				return false
 			}()

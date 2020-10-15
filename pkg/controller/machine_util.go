@@ -23,16 +23,37 @@ Modifications Copyright (c) 2017 SAP SE or an SAP affiliate company. All rights 
 package controller
 
 import (
+	"encoding/json"
+
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/validation"
-	"github.com/golang/glog"
+	"github.com/gardener/machine-controller-manager/pkg/util/nodeops"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog"
 
 	machineapi "github.com/gardener/machine-controller-manager/pkg/apis/machine"
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
 	v1alpha1client "github.com/gardener/machine-controller-manager/pkg/client/clientset/versioned/typed/machine/v1alpha1"
 	v1alpha1listers "github.com/gardener/machine-controller-manager/pkg/client/listers/machine/v1alpha1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	errorsutil "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/util/retry"
+)
+
+const (
+	// LastAppliedALTAnnotation contains the last configuration of annotations, labels & taints applied on the node object
+	LastAppliedALTAnnotation = "node.machine.sapcloud.io/last-applied-anno-labels-taints"
+	// NodeTerminationCondition describes nodes that are terminating
+	NodeTerminationCondition = "Termination"
+	// NodeUnhealthy is a node termination reason for failed machines
+	NodeUnhealthy = "Unhealthy"
+	// NodeScaledDown is a node termination reason for healthy deleted machines
+	NodeScaledDown = "ScaleDown"
+)
+
+var (
+	// emptyMap is a dummy emptyMap to compare with
+	emptyMap = make(map[string]string)
 )
 
 // TODO: use client library instead when it starts to support update retries
@@ -62,7 +83,7 @@ func UpdateMachineWithRetries(machineClient v1alpha1client.MachineInterface, mac
 	// Ignore the precondition violated error, this machine is already updated
 	// with the desired label.
 	if retryErr == errorsutil.ErrPreconditionViolated {
-		glog.V(4).Infof("Machine %s precondition doesn't hold, skip updating it.", name)
+		klog.V(4).Infof("Machine %s precondition doesn't hold, skip updating it.", name)
 		retryErr = nil
 	}
 
@@ -75,10 +96,10 @@ func (c *controller) validateMachineClass(classSpec *v1alpha1.ClassSpec) (interf
 	var secretRef *v1.Secret
 
 	switch classSpec.Kind {
-	case "AWSMachineClass":
+	case AWSMachineClassKind:
 		AWSMachineClass, err := c.awsMachineClassLister.AWSMachineClasses(c.namespace).Get(classSpec.Name)
 		if err != nil {
-			glog.V(2).Infof("AWSMachineClass %q/%q not found. Skipping. %v", c.namespace, classSpec.Name, err)
+			klog.V(2).Infof("AWSMachineClass %q/%q not found. Skipping. %v", c.namespace, classSpec.Name, err)
 			return MachineClass, secretRef, err
 		}
 		MachineClass = AWSMachineClass
@@ -87,26 +108,26 @@ func (c *controller) validateMachineClass(classSpec *v1alpha1.ClassSpec) (interf
 		internalAWSMachineClass := &machineapi.AWSMachineClass{}
 		err = c.internalExternalScheme.Convert(AWSMachineClass, internalAWSMachineClass, nil)
 		if err != nil {
-			glog.V(2).Info("Error in scheme conversion")
+			klog.V(2).Info("Error in scheme conversion")
 			return MachineClass, secretRef, err
 		}
 
 		validationerr := validation.ValidateAWSMachineClass(internalAWSMachineClass)
 		if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-			glog.V(2).Infof("Validation of AWSMachineClass failed %s", validationerr.ToAggregate().Error())
+			klog.V(2).Infof("Validation of AWSMachineClass failed %s", validationerr.ToAggregate().Error())
 			return MachineClass, secretRef, nil
 		}
 
 		// Get secretRef
 		secretRef, err = c.getSecret(AWSMachineClass.Spec.SecretRef, AWSMachineClass.Name)
 		if err != nil || secretRef == nil {
-			glog.V(2).Info("Secret reference not found")
+			klog.V(2).Info("Secret reference not found")
 			return MachineClass, secretRef, err
 		}
-	case "AzureMachineClass":
+	case AzureMachineClassKind:
 		AzureMachineClass, err := c.azureMachineClassLister.AzureMachineClasses(c.namespace).Get(classSpec.Name)
 		if err != nil {
-			glog.V(2).Infof("AzureMachineClass %q not found. Skipping. %v", classSpec.Name, err)
+			klog.V(2).Infof("AzureMachineClass %q not found. Skipping. %v", classSpec.Name, err)
 			return MachineClass, secretRef, err
 		}
 		MachineClass = AzureMachineClass
@@ -115,27 +136,27 @@ func (c *controller) validateMachineClass(classSpec *v1alpha1.ClassSpec) (interf
 		internalAzureMachineClass := &machineapi.AzureMachineClass{}
 		err = c.internalExternalScheme.Convert(AzureMachineClass, internalAzureMachineClass, nil)
 		if err != nil {
-			glog.V(2).Info("Error in scheme conversion")
+			klog.V(2).Info("Error in scheme conversion")
 			return MachineClass, secretRef, err
 		}
 
 		validationerr := validation.ValidateAzureMachineClass(internalAzureMachineClass)
 		if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-			glog.V(2).Infof("Validation of AzureMachineClass failed %s", validationerr.ToAggregate().Error())
+			klog.V(2).Infof("Validation of AzureMachineClass failed %s", validationerr.ToAggregate().Error())
 			return MachineClass, secretRef, nil
 		}
 
 		// Get secretRef
 		secretRef, err = c.getSecret(AzureMachineClass.Spec.SecretRef, AzureMachineClass.Name)
 		if err != nil || secretRef == nil {
-			glog.V(2).Info("Secret reference not found")
+			klog.V(2).Info("Secret reference not found")
 			return MachineClass, secretRef, err
 
 		}
-	case "GCPMachineClass":
+	case GCPMachineClassKind:
 		GCPMachineClass, err := c.gcpMachineClassLister.GCPMachineClasses(c.namespace).Get(classSpec.Name)
 		if err != nil {
-			glog.V(2).Infof("GCPMachineClass %q not found. Skipping. %v", classSpec.Name, err)
+			klog.V(2).Infof("GCPMachineClass %q not found. Skipping. %v", classSpec.Name, err)
 			return MachineClass, secretRef, err
 		}
 		MachineClass = GCPMachineClass
@@ -144,26 +165,26 @@ func (c *controller) validateMachineClass(classSpec *v1alpha1.ClassSpec) (interf
 		internalGCPMachineClass := &machineapi.GCPMachineClass{}
 		err = c.internalExternalScheme.Convert(GCPMachineClass, internalGCPMachineClass, nil)
 		if err != nil {
-			glog.V(2).Info("Error in scheme conversion")
+			klog.V(2).Info("Error in scheme conversion")
 			return MachineClass, secretRef, err
 		}
 
 		validationerr := validation.ValidateGCPMachineClass(internalGCPMachineClass)
 		if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-			glog.V(2).Infof("Validation of GCPMachineClass failed %s", validationerr.ToAggregate().Error())
+			klog.V(2).Infof("Validation of GCPMachineClass failed %s", validationerr.ToAggregate().Error())
 			return MachineClass, secretRef, nil
 		}
 
 		// Get secretRef
 		secretRef, err = c.getSecret(GCPMachineClass.Spec.SecretRef, GCPMachineClass.Name)
 		if err != nil || secretRef == nil {
-			glog.V(2).Info("Secret reference not found")
+			klog.V(2).Info("Secret reference not found")
 			return MachineClass, secretRef, err
 		}
-	case "OpenStackMachineClass":
+	case OpenStackMachineClassKind:
 		OpenStackMachineClass, err := c.openStackMachineClassLister.OpenStackMachineClasses(c.namespace).Get(classSpec.Name)
 		if err != nil {
-			glog.V(2).Infof("OpenStackMachineClass %q not found. Skipping. %v", classSpec.Name, err)
+			klog.V(2).Infof("OpenStackMachineClass %q not found. Skipping. %v", classSpec.Name, err)
 			return MachineClass, secretRef, err
 		}
 		MachineClass = OpenStackMachineClass
@@ -172,26 +193,26 @@ func (c *controller) validateMachineClass(classSpec *v1alpha1.ClassSpec) (interf
 		internalOpenStackMachineClass := &machineapi.OpenStackMachineClass{}
 		err = c.internalExternalScheme.Convert(OpenStackMachineClass, internalOpenStackMachineClass, nil)
 		if err != nil {
-			glog.V(2).Info("Error in scheme conversion")
+			klog.V(2).Info("Error in scheme conversion")
 			return MachineClass, secretRef, err
 		}
 
 		validationerr := validation.ValidateOpenStackMachineClass(internalOpenStackMachineClass)
 		if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-			glog.V(2).Infof("Validation of OpenStackMachineClass failed %s", validationerr.ToAggregate().Error())
+			klog.V(2).Infof("Validation of OpenStackMachineClass failed %s", validationerr.ToAggregate().Error())
 			return MachineClass, secretRef, nil
 		}
 
 		// Get secretRef
 		secretRef, err = c.getSecret(OpenStackMachineClass.Spec.SecretRef, OpenStackMachineClass.Name)
 		if err != nil || secretRef == nil {
-			glog.V(2).Info("Secret reference not found")
+			klog.V(2).Info("Secret reference not found")
 			return MachineClass, secretRef, err
 		}
-	case "AlicloudMachineClass":
+	case AlicloudMachineClassKind:
 		AlicloudMachineClass, err := c.alicloudMachineClassLister.AlicloudMachineClasses(c.namespace).Get(classSpec.Name)
 		if err != nil {
-			glog.V(2).Infof("AlicloudMachineClass %q/%q not found. Skipping. %v", c.namespace, classSpec.Name, err)
+			klog.V(2).Infof("AlicloudMachineClass %q/%q not found. Skipping. %v", c.namespace, classSpec.Name, err)
 			return MachineClass, secretRef, err
 		}
 		MachineClass = AlicloudMachineClass
@@ -200,26 +221,26 @@ func (c *controller) validateMachineClass(classSpec *v1alpha1.ClassSpec) (interf
 		internalAlicloudMachineClass := &machineapi.AlicloudMachineClass{}
 		err = c.internalExternalScheme.Convert(AlicloudMachineClass, internalAlicloudMachineClass, nil)
 		if err != nil {
-			glog.V(2).Info("Error in scheme convertion")
+			klog.V(2).Info("Error in scheme conversion")
 			return MachineClass, secretRef, err
 		}
 
 		validationerr := validation.ValidateAlicloudMachineClass(internalAlicloudMachineClass)
 		if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-			glog.V(2).Infof("Validation of AlicloudMachineClass failed %s", validationerr.ToAggregate().Error())
+			klog.V(2).Infof("Validation of AlicloudMachineClass failed %s", validationerr.ToAggregate().Error())
 			return MachineClass, secretRef, nil
 		}
 
 		// Get secretRef
 		secretRef, err = c.getSecret(AlicloudMachineClass.Spec.SecretRef, AlicloudMachineClass.Name)
 		if err != nil || secretRef == nil {
-			glog.V(2).Info("Secret reference not found")
+			klog.V(2).Info("Secret reference not found")
 			return MachineClass, secretRef, err
 		}
-	case "PacketMachineClass":
+	case PacketMachineClassKind:
 		PacketMachineClass, err := c.packetMachineClassLister.PacketMachineClasses(c.namespace).Get(classSpec.Name)
 		if err != nil {
-			glog.V(2).Infof("PacketMachineClass %q/%q not found. Skipping. %v", c.namespace, classSpec.Name, err)
+			klog.V(2).Infof("PacketMachineClass %q/%q not found. Skipping. %v", c.namespace, classSpec.Name, err)
 			return MachineClass, secretRef, err
 		}
 		MachineClass = PacketMachineClass
@@ -228,24 +249,24 @@ func (c *controller) validateMachineClass(classSpec *v1alpha1.ClassSpec) (interf
 		internalPacketMachineClass := &machineapi.PacketMachineClass{}
 		err = c.internalExternalScheme.Convert(PacketMachineClass, internalPacketMachineClass, nil)
 		if err != nil {
-			glog.V(2).Info("Error in scheme conversion")
+			klog.V(2).Info("Error in scheme conversion")
 			return MachineClass, secretRef, err
 		}
 
 		validationerr := validation.ValidatePacketMachineClass(internalPacketMachineClass)
 		if validationerr.ToAggregate() != nil && len(validationerr.ToAggregate().Errors()) > 0 {
-			glog.V(2).Infof("Validation of PacketMachineClass failed %s", validationerr.ToAggregate().Error())
+			klog.V(2).Infof("Validation of PacketMachineClass failed %s", validationerr.ToAggregate().Error())
 			return MachineClass, secretRef, nil
 		}
 
 		// Get secretRef
 		secretRef, err = c.getSecret(PacketMachineClass.Spec.SecretRef, PacketMachineClass.Name)
 		if err != nil || secretRef == nil {
-			glog.V(2).Info("Secret reference not found")
+			klog.V(2).Info("Secret reference not found")
 			return MachineClass, secretRef, err
 		}
 	default:
-		glog.V(2).Infof("ClassKind %q not found", classSpec.Kind)
+		klog.V(2).Infof("ClassKind %q not found. Machine maybe be processed by external controller", classSpec.Kind)
 	}
 
 	return MachineClass, secretRef, nil
@@ -265,4 +286,270 @@ func nodeConditionsHaveChanged(machineConditions []v1.NodeCondition, nodeConditi
 	}
 
 	return false
+}
+
+// syncMachineNodeTemplate syncs nodeTemplates between machine and corresponding node-object.
+// It ensures, that any nodeTemplate element available on Machine should be available on node-object.
+// Although there could be more elements already available on node-object which will not be touched.
+func (c *controller) syncMachineNodeTemplates(machine *v1alpha1.Machine) error {
+	var (
+		initializedNodeAnnotation   = false
+		lastAppliedALT              v1alpha1.NodeTemplateSpec
+		currentlyAppliedALTJSONByte []byte
+	)
+
+	node, err := c.nodeLister.Get(machine.Status.Node)
+	if err != nil || node == nil {
+		klog.Errorf("Error: Could not get the node-object or node-object is missing - err: %q", err)
+		// Dont return error so that other steps can be executed.
+		return nil
+	}
+	nodeCopy := node.DeepCopy()
+
+	// Initialize node annotations if empty
+	if nodeCopy.Annotations == nil {
+		nodeCopy.Annotations = make(map[string]string)
+		initializedNodeAnnotation = true
+	}
+
+	// Extracts the last applied annotations to lastAppliedLabels
+	lastAppliedALTJSONString, exists := node.Annotations[LastAppliedALTAnnotation]
+	if exists {
+		err = json.Unmarshal([]byte(lastAppliedALTJSONString), &lastAppliedALT)
+		if err != nil {
+			klog.Errorf("Error occurred while syncing node annotations, labels & taints: %s", err)
+			return err
+		}
+	}
+
+	annotationsChanged := SyncMachineAnnotations(machine, nodeCopy, lastAppliedALT.Annotations)
+	labelsChanged := SyncMachineLabels(machine, nodeCopy, lastAppliedALT.Labels)
+	taintsChanged := SyncMachineTaints(machine, nodeCopy, lastAppliedALT.Spec.Taints)
+
+	// Update node-object with latest nodeTemplate elements if elements have changed.
+	if initializedNodeAnnotation || labelsChanged || annotationsChanged || taintsChanged {
+
+		klog.V(2).Infof(
+			"Updating machine annotations:%v, labels:%v, taints:%v for machine: %q",
+			annotationsChanged,
+			labelsChanged,
+			taintsChanged,
+			machine.Name,
+		)
+
+		// Update the LastAppliedALTAnnotation
+		lastAppliedALT = machine.Spec.NodeTemplateSpec
+		currentlyAppliedALTJSONByte, err = json.Marshal(lastAppliedALT)
+		if err != nil {
+			klog.Errorf("Error occurred while syncing node annotations, labels & taints: %s", err)
+			return err
+		}
+		nodeCopy.Annotations[LastAppliedALTAnnotation] = string(currentlyAppliedALTJSONByte)
+
+		_, err := c.targetCoreClient.CoreV1().Nodes().Update(nodeCopy)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SyncMachineAnnotations syncs the annotations of the machine with node-objects.
+// It returns true if update is needed else false.
+func SyncMachineAnnotations(
+	machine *v1alpha1.Machine,
+	node *v1.Node,
+	lastAppliedAnnotations map[string]string,
+) bool {
+	toBeUpdated := false
+	mAnnotations, nAnnotations := machine.Spec.NodeTemplateSpec.Annotations, node.Annotations
+
+	// Initialize node annotations if nil
+	if nAnnotations == nil {
+		nAnnotations = make(map[string]string)
+		node.Annotations = nAnnotations
+	}
+	// Intialize machine annotations to empty map if nil
+	if mAnnotations == nil {
+		mAnnotations = emptyMap
+	}
+
+	// Delete any annotation that existed in the past but has been deleted now
+	for lastAppliedAnnotationKey := range lastAppliedAnnotations {
+		if _, exists := mAnnotations[lastAppliedAnnotationKey]; !exists {
+			delete(nAnnotations, lastAppliedAnnotationKey)
+			toBeUpdated = true
+		}
+	}
+
+	// Add/Update any key that doesn't exist or whose value as changed
+	for mKey, mValue := range mAnnotations {
+		if nValue, exists := nAnnotations[mKey]; !exists || mValue != nValue {
+			nAnnotations[mKey] = mValue
+			toBeUpdated = true
+		}
+	}
+
+	return toBeUpdated
+}
+
+// SyncMachineLabels syncs the labels of the machine with node-objects.
+// It returns true if update is needed else false.
+func SyncMachineLabels(
+	machine *v1alpha1.Machine,
+	node *v1.Node,
+	lastAppliedLabels map[string]string,
+) bool {
+	toBeUpdated := false
+	mLabels, nLabels := machine.Spec.NodeTemplateSpec.Labels, node.Labels
+
+	// Initialize node labels if nil
+	if nLabels == nil {
+		nLabels = make(map[string]string)
+		node.Labels = nLabels
+	}
+	// Intialize machine labels to empty map if nil
+	if mLabels == nil {
+		mLabels = emptyMap
+	}
+
+	// Delete any labels that existed in the past but has been deleted now
+	for lastAppliedLabelKey := range lastAppliedLabels {
+		if _, exists := mLabels[lastAppliedLabelKey]; !exists {
+			delete(nLabels, lastAppliedLabelKey)
+			toBeUpdated = true
+		}
+	}
+
+	// Add/Update any key that doesn't exist or whose value as changed
+	for mKey, mValue := range mLabels {
+		if nValue, exists := nLabels[mKey]; !exists || mValue != nValue {
+			nLabels[mKey] = mValue
+			toBeUpdated = true
+		}
+	}
+
+	return toBeUpdated
+}
+
+type taintKeyEffect struct {
+	// Required. The taint key to be applied to a node.
+	Key string
+	// Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+	Effect v1.TaintEffect
+}
+
+// SyncMachineTaints syncs the taints of the machine with node-objects.
+// It returns true if update is needed else false.
+func SyncMachineTaints(
+	machine *v1alpha1.Machine,
+	node *v1.Node,
+	lastAppliedTaints []v1.Taint,
+) bool {
+	toBeUpdated := false
+	mTaints, nTaints := machine.Spec.NodeTemplateSpec.Spec.Taints, node.Spec.Taints
+	mTaintsMap := make(map[taintKeyEffect]*v1.Taint)
+	nTaintsMap := make(map[taintKeyEffect]*v1.Taint)
+
+	// Convert the slice of taints to map of taint [key, effect] = Taint
+	// Helps with indexed searching
+	for i := range mTaints {
+		mTaint := &mTaints[i]
+		taintKE := taintKeyEffect{
+			Key:    mTaint.Key,
+			Effect: mTaint.Effect,
+		}
+		mTaintsMap[taintKE] = mTaint
+	}
+	for i := range nTaints {
+		nTaint := &nTaints[i]
+		taintKE := taintKeyEffect{
+			Key:    nTaint.Key,
+			Effect: nTaint.Effect,
+		}
+		nTaintsMap[taintKE] = nTaint
+	}
+
+	// Delete taints that existed on the machine object in the last update but deleted now
+	for _, lastAppliedTaint := range lastAppliedTaints {
+
+		lastAppliedKE := taintKeyEffect{
+			Key:    lastAppliedTaint.Key,
+			Effect: lastAppliedTaint.Effect,
+		}
+
+		if _, exists := mTaintsMap[lastAppliedKE]; !exists {
+			delete(nTaintsMap, lastAppliedKE)
+			toBeUpdated = true
+		}
+	}
+
+	// Add any taints that exists in the machine object but not on the node object
+	for mKE, mV := range mTaintsMap {
+		if nV, exists := nTaintsMap[mKE]; !exists || *nV != *mV {
+			nTaintsMap[mKE] = mV
+			toBeUpdated = true
+		}
+	}
+
+	if toBeUpdated {
+		// Convert the map of taints to slice of taints
+		nTaints = make([]v1.Taint, len(nTaintsMap))
+		i := 0
+		for _, nV := range nTaintsMap {
+			nTaints[i] = *nV
+			i++
+		}
+		node.Spec.Taints = nTaints
+	}
+
+	return toBeUpdated
+}
+
+func (c *controller) UpdateNodeTerminationCondition(machine *v1alpha1.Machine) error {
+	if machine.Status.CurrentStatus.Phase == "" {
+		return nil
+	}
+
+	nodeName := machine.Status.Node
+
+	terminationCondition := v1.NodeCondition{
+		Type:               NodeTerminationCondition,
+		Status:             v1.ConditionTrue,
+		LastHeartbeatTime:  metav1.Now(),
+		LastTransitionTime: metav1.Now(),
+	}
+
+	// check if condition already exists
+	cond, err := nodeops.GetNodeCondition(c.targetCoreClient, nodeName, NodeTerminationCondition)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if cond != nil && machine.Status.CurrentStatus.Phase == v1alpha1.MachineTerminating {
+		// do not consider machine terminating phase if node already terminating
+		terminationCondition.Reason = cond.Reason
+		terminationCondition.Message = cond.Message
+	} else {
+		setTerminationReasonByPhase(machine.Status.CurrentStatus.Phase, &terminationCondition)
+	}
+
+	err = nodeops.AddOrUpdateConditionsOnNode(c.targetCoreClient, nodeName, terminationCondition)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func setTerminationReasonByPhase(phase v1alpha1.MachinePhase, terminationCondition *v1.NodeCondition) {
+	if phase == v1alpha1.MachineFailed { // if failed, terminated due to health
+		terminationCondition.Reason = NodeUnhealthy
+		terminationCondition.Message = "Machine Controller is terminating failed machine"
+	} else { // in all other cases (except for already terminating): assume scale down
+		terminationCondition.Reason = NodeScaledDown
+		terminationCondition.Message = "Machine Controller is scaling down machine"
+	}
 }

@@ -21,6 +21,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 
 	v1alpha1 "github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
@@ -33,7 +35,15 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/golang/glog"
+	"k8s.io/klog"
+)
+
+const (
+	// awsEBSDriverName is the name of the CSI driver for EBS
+	awsEBSDriverName = "ebs.csi.aws.com"
+
+	resourceTypeInstance = "instance"
+	resourceTypeVolume   = "volume"
 )
 
 // AWSDriver is the driver struct for holding AWS machine information
@@ -52,8 +62,11 @@ func NewAWSDriver(create func() (string, error), delete func() error, existing f
 
 // Create method is used to create a AWS machine
 func (d *AWSDriver) Create() (string, string, error) {
+	svc, err := d.createSVC()
+	if err != nil {
+		return "Error", "Error", err
+	}
 
-	svc := d.createSVC()
 	UserDataEnc := base64.StdEncoding.EncodeToString([]byte(d.UserData))
 
 	var imageIds []*string
@@ -70,25 +83,87 @@ func (d *AWSDriver) Create() (string, string, error) {
 	}
 	metrics.APIRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
 
-	var blkDeviceMappings []*ec2.BlockDeviceMapping
-	deviceName := output.Images[0].RootDeviceName
-	volumeSize := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeSize
-	volumeType := d.AWSMachineClass.Spec.BlockDevices[0].Ebs.VolumeType
-	blkDeviceMapping := ec2.BlockDeviceMapping{
-		DeviceName: deviceName,
-		Ebs: &ec2.EbsBlockDevice{
-			VolumeSize: &volumeSize,
-			VolumeType: &volumeType,
+	if len(output.Images) < 1 {
+		return "Error", "Error", fmt.Errorf("Image %s not found", *imageID)
+	}
+
+	blkDeviceMappings, err := d.generateBlockDevices(d.AWSMachineClass.Spec.BlockDevices, output.Images[0].RootDeviceName)
+	if err != nil {
+		return "Error", "Error", err
+	}
+
+	tagInstance, err := d.generateTags(d.AWSMachineClass.Spec.Tags, resourceTypeInstance)
+	if err != nil {
+		return "Error", "Error", err
+	}
+
+	tagVolume, err := d.generateTags(d.AWSMachineClass.Spec.Tags, resourceTypeVolume)
+	if err != nil {
+		return "Error", "Error", err
+	}
+
+	var networkInterfaceSpecs []*ec2.InstanceNetworkInterfaceSpecification
+	for i, netIf := range d.AWSMachineClass.Spec.NetworkInterfaces {
+		spec := &ec2.InstanceNetworkInterfaceSpecification{
+			Groups:                   aws.StringSlice(netIf.SecurityGroupIDs),
+			DeviceIndex:              aws.Int64(int64(i)),
+			AssociatePublicIpAddress: netIf.AssociatePublicIPAddress,
+			DeleteOnTermination:      netIf.DeleteOnTermination,
+			Description:              netIf.Description,
+			SubnetId:                 aws.String(netIf.SubnetID),
+		}
+
+		if netIf.DeleteOnTermination == nil {
+			spec.DeleteOnTermination = aws.Bool(true)
+		}
+
+		networkInterfaceSpecs = append(networkInterfaceSpecs, spec)
+	}
+
+	// Specify the details of the machine
+	inputConfig := ec2.RunInstancesInput{
+		ImageId:           aws.String(d.AWSMachineClass.Spec.AMI),
+		InstanceType:      aws.String(d.AWSMachineClass.Spec.MachineType),
+		MinCount:          aws.Int64(1),
+		MaxCount:          aws.Int64(1),
+		UserData:          &UserDataEnc,
+		KeyName:           aws.String(d.AWSMachineClass.Spec.KeyName),
+		NetworkInterfaces: networkInterfaceSpecs,
+		IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
+			Name: &(d.AWSMachineClass.Spec.IAM.Name),
 		},
+		BlockDeviceMappings: blkDeviceMappings,
+		TagSpecifications:   []*ec2.TagSpecification{tagInstance, tagVolume},
 	}
-	if volumeType == "io1" {
-		blkDeviceMapping.Ebs.Iops = &d.AWSMachineClass.Spec.BlockDevices[0].Ebs.Iops
+
+	if d.AWSMachineClass.Spec.SpotPrice != nil {
+		inputConfig.InstanceMarketOptions = &ec2.InstanceMarketOptionsRequest{
+			MarketType: aws.String(ec2.MarketTypeSpot),
+			SpotOptions: &ec2.SpotMarketOptions{
+				SpotInstanceType: aws.String(ec2.SpotInstanceTypeOneTime),
+			},
+		}
+
+		if *d.AWSMachineClass.Spec.SpotPrice != "" {
+			inputConfig.InstanceMarketOptions.SpotOptions.MaxPrice = d.AWSMachineClass.Spec.SpotPrice
+		}
 	}
-	blkDeviceMappings = append(blkDeviceMappings, &blkDeviceMapping)
+
+	runResult, err := svc.RunInstances(&inputConfig)
+	if err != nil {
+		metrics.APIFailedRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
+		return "Error", "Error", err
+	}
+	metrics.APIRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
+
+	return d.encodeMachineID(d.AWSMachineClass.Spec.Region, *runResult.Instances[0].InstanceId), *runResult.Instances[0].PrivateDnsName, nil
+}
+
+func (d *AWSDriver) generateTags(tags map[string]string, resourceType string) (*ec2.TagSpecification, error) {
 
 	// Add tags to the created machine
 	tagList := []*ec2.Tag{}
-	for idx, element := range d.AWSMachineClass.Spec.Tags {
+	for idx, element := range tags {
 		if idx == "Name" {
 			// Name tag cannot be set, as its used to identify backing machine object
 			continue
@@ -106,56 +181,146 @@ func (d *AWSDriver) Create() (string, string, error) {
 	tagList = append(tagList, &nameTag)
 
 	tagInstance := &ec2.TagSpecification{
-		ResourceType: aws.String("instance"),
+		ResourceType: aws.String(resourceType),
 		Tags:         tagList,
 	}
+	return tagInstance, nil
+}
 
-	// Specify the details of the machine that you want to create.
-	inputConfig := ec2.RunInstancesInput{
-		// An Amazon Linux AMI ID for t2.micro machines in the us-west-2 region
-		ImageId:      aws.String(d.AWSMachineClass.Spec.AMI),
-		InstanceType: aws.String(d.AWSMachineClass.Spec.MachineType),
-		MinCount:     aws.Int64(1),
-		MaxCount:     aws.Int64(1),
-		UserData:     &UserDataEnc,
-		KeyName:      aws.String(d.AWSMachineClass.Spec.KeyName),
-		SubnetId:     aws.String(d.AWSMachineClass.Spec.NetworkInterfaces[0].SubnetID),
-		IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
-			Name: &(d.AWSMachineClass.Spec.IAM.Name),
-		},
-		SecurityGroupIds:    []*string{aws.String(d.AWSMachineClass.Spec.NetworkInterfaces[0].SecurityGroupIDs[0])},
-		BlockDeviceMappings: blkDeviceMappings,
-		TagSpecifications:   []*ec2.TagSpecification{tagInstance},
+func (d *AWSDriver) generateBlockDevices(blockDevices []v1alpha1.AWSBlockDeviceMappingSpec, rootDeviceName *string) ([]*ec2.BlockDeviceMapping, error) {
+
+	var blkDeviceMappings []*ec2.BlockDeviceMapping
+	// if blockDevices is empty, AWS will automatically create a root partition
+	for _, disk := range blockDevices {
+
+		deviceName := disk.DeviceName
+		if disk.DeviceName == "/root" || len(blockDevices) == 1 {
+			deviceName = *rootDeviceName
+		}
+		deleteOnTermination := disk.Ebs.DeleteOnTermination
+		volumeSize := disk.Ebs.VolumeSize
+		volumeType := disk.Ebs.VolumeType
+		encrypted := disk.Ebs.Encrypted
+		snapshotID := disk.Ebs.SnapshotID
+
+		blkDeviceMapping := ec2.BlockDeviceMapping{
+			DeviceName: aws.String(deviceName),
+			Ebs: &ec2.EbsBlockDevice{
+				Encrypted:  aws.Bool(encrypted),
+				VolumeSize: aws.Int64(volumeSize),
+				VolumeType: aws.String(volumeType),
+			},
+		}
+		if deleteOnTermination != nil {
+			blkDeviceMapping.Ebs.DeleteOnTermination = deleteOnTermination
+		}
+
+		if volumeType == "io1" {
+			blkDeviceMapping.Ebs.Iops = aws.Int64(disk.Ebs.Iops)
+		}
+
+		if snapshotID != nil {
+			blkDeviceMapping.Ebs.SnapshotId = snapshotID
+		}
+		blkDeviceMappings = append(blkDeviceMappings, &blkDeviceMapping)
 	}
 
-	runResult, err := svc.RunInstances(&inputConfig)
-	if err != nil {
-		metrics.APIFailedRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
-		return "Error", "Error", err
-	}
-	metrics.APIRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
+	return blkDeviceMappings, nil
+}
 
-	return d.encodeMachineID(d.AWSMachineClass.Spec.Region, *runResult.Instances[0].InstanceId), *runResult.Instances[0].PrivateDnsName, nil
+// checkBlockDevices returns instanceBlockDevices whose DeleteOnTermination
+// field is nil on machineAPIs and resets the values to true,
+// to allow deletion on termination of instance
+func (d *AWSDriver) checkBlockDevices(instanceID string, rootDeviceName *string) ([]*ec2.InstanceBlockDeviceMappingSpecification, error) {
+	blockDevices := d.AWSMachineClass.Spec.BlockDevices
+	var instanceBlkDeviceMappings []*ec2.InstanceBlockDeviceMappingSpecification
+
+	for _, disk := range d.AWSMachineClass.Spec.BlockDevices {
+
+		deviceName := disk.DeviceName
+		if disk.DeviceName == "/root" || len(blockDevices) == 1 {
+			deviceName = *rootDeviceName
+		}
+
+		deleteOnTermination := disk.Ebs.DeleteOnTermination
+
+		if deleteOnTermination == nil {
+			blkDeviceMapping := ec2.InstanceBlockDeviceMappingSpecification{
+				DeviceName: aws.String(deviceName),
+				Ebs: &ec2.EbsInstanceBlockDeviceSpecification{
+					DeleteOnTermination: aws.Bool(true),
+				},
+			}
+			instanceBlkDeviceMappings = append(instanceBlkDeviceMappings, &blkDeviceMapping)
+		}
+
+	}
+
+	return instanceBlkDeviceMappings, nil
 }
 
 // Delete method is used to delete a AWS machine
-func (d *AWSDriver) Delete() error {
+func (d *AWSDriver) Delete(machineID string) error {
+	var imageIds []*string
+	imageID := aws.String(d.AWSMachineClass.Spec.AMI)
+	imageIds = append(imageIds, imageID)
 
-	result, err := d.GetVMs(d.MachineID)
+	result, err := d.GetVMs(machineID)
 	if err != nil {
 		return err
 	} else if len(result) == 0 {
 		// No running instance exists with the given machine-ID
-		glog.V(2).Infof("No VM matching the machine-ID found on the provider %q", d.MachineID)
+		klog.V(2).Infof("No VM matching the machine-ID found on the provider %q", machineID)
 		return nil
 	}
 
-	machineID := d.decodeMachineID(d.MachineID)
+	instanceID := d.decodeMachineID(machineID)
+	svc, err := d.createSVC()
+	if err != nil {
+		return err
+	}
 
-	svc := d.createSVC()
+	describeImagesRequest := ec2.DescribeImagesInput{
+		ImageIds: imageIds,
+	}
+	describeImageOutput, err := svc.DescribeImages(&describeImagesRequest)
+	if err != nil {
+		metrics.APIFailedRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
+		return err
+	}
+	metrics.APIRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
+
+	if len(describeImageOutput.Images) < 1 {
+		// Disk image not found at provider
+		klog.Warningf("Disk image %s not found at provider for machineID %q", *imageID, machineID)
+	} else {
+		// returns instanceBlockDevices whose DeleteOnTermination field is nil on machineAPIs
+		instanceBlkDeviceMappings, err := d.checkBlockDevices(instanceID, describeImageOutput.Images[0].RootDeviceName)
+		if err != nil {
+			klog.Errorf("Could not Default deletionOnTermination while terminating machine: %s", err.Error())
+		}
+
+		// Default deletionOnTermination to true when unset on API field
+		if err == nil && len(instanceBlkDeviceMappings) > 0 {
+			input := &ec2.ModifyInstanceAttributeInput{
+				InstanceId:          aws.String(instanceID),
+				BlockDeviceMappings: instanceBlkDeviceMappings,
+			}
+			_, err = svc.ModifyInstanceAttribute(input)
+			if err != nil {
+				metrics.APIFailedRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
+				klog.Warningf("Couldn't complete modify instance with machineID %q. Error: %s. Continuing machine deletion", machineID, err.Error())
+			} else {
+				metrics.APIRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
+				klog.V(2).Infof("Successfully defaulted deletionOnTermination to true for disks (with nil pointer) for machineID: %q", machineID)
+			}
+		}
+	}
+
+	// Terminate instance call
 	input := &ec2.TerminateInstancesInput{
 		InstanceIds: []*string{
-			aws.String(machineID),
+			aws.String(instanceID),
 		},
 		DryRun: aws.Bool(true),
 	}
@@ -167,13 +332,13 @@ func (d *AWSDriver) Delete() error {
 		output, err := svc.TerminateInstances(input)
 		if err != nil {
 			metrics.APIFailedRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
-			glog.Errorf("Could not terminate machine: %s", err.Error())
+			klog.Errorf("Could not terminate machine: %s", err.Error())
 			return err
 		}
 		metrics.APIRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
 
 		vmState := output.TerminatingInstances[0]
-		//glog.Info(vmState.PreviousState, vmState.CurrentState)
+		//klog.Info(vmState.PreviousState, vmState.CurrentState)
 
 		if *vmState.CurrentState.Name == "shutting-down" ||
 			*vmState.CurrentState.Name == "terminated" {
@@ -183,7 +348,7 @@ func (d *AWSDriver) Delete() error {
 		err = errors.New("Machine already terminated")
 	}
 
-	glog.Errorf("Could not terminate machine: %s", err.Error())
+	klog.Errorf("Could not terminate machine: %s", err.Error())
 	return err
 }
 
@@ -212,22 +377,26 @@ func (d *AWSDriver) GetVMs(machineID string) (VMs, error) {
 		return listOfVMs, nil
 	}
 
-	svc := d.createSVC()
+	svc, err := d.createSVC()
+	if err != nil {
+		return listOfVMs, err
+	}
+
 	input := ec2.DescribeInstancesInput{
 		Filters: []*ec2.Filter{
-			&ec2.Filter{
+			{
 				Name: aws.String("tag-key"),
 				Values: []*string{
 					&clusterName,
 				},
 			},
-			&ec2.Filter{
+			{
 				Name: aws.String("tag-key"),
 				Values: []*string{
 					&nodeRole,
 				},
 			},
-			&ec2.Filter{
+			{
 				Name: aws.String("instance-state-name"),
 				Values: []*string{
 					aws.String("pending"),
@@ -254,7 +423,7 @@ func (d *AWSDriver) GetVMs(machineID string) (VMs, error) {
 	runResult, err := svc.DescribeInstances(&input)
 	if err != nil {
 		metrics.APIFailedRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
-		glog.Errorf("AWS driver is returning error while describe instances request is sent: %s", err)
+		klog.Errorf("AWS driver is returning error while describe instances request is sent: %s", err)
 		return listOfVMs, err
 	}
 	metrics.APIRequestCount.With(prometheus.Labels{"provider": "aws", "service": "ecs"}).Inc()
@@ -277,24 +446,29 @@ func (d *AWSDriver) GetVMs(machineID string) (VMs, error) {
 }
 
 // Helper function to create SVC
-func (d *AWSDriver) createSVC() *ec2.EC2 {
+func (d *AWSDriver) createSVC() (*ec2.EC2, error) {
+	var (
+		config = &aws.Config{
+			Region: aws.String(d.AWSMachineClass.Spec.Region),
+		}
 
-	accessKeyID := strings.TrimSpace(string(d.CloudConfig.Data[v1alpha1.AWSAccessKeyID]))
-	secretAccessKey := strings.TrimSpace(string(d.CloudConfig.Data[v1alpha1.AWSSecretAccessKey]))
+		accessKeyID     = strings.TrimSpace(string(d.CloudConfig.Data[v1alpha1.AWSAccessKeyID]))
+		secretAccessKey = strings.TrimSpace(string(d.CloudConfig.Data[v1alpha1.AWSSecretAccessKey]))
+	)
 
 	if accessKeyID != "" && secretAccessKey != "" {
-		return ec2.New(session.New(&aws.Config{
-			Region: aws.String(d.AWSMachineClass.Spec.Region),
-			Credentials: credentials.NewStaticCredentialsFromCreds(credentials.Value{
-				AccessKeyID:     accessKeyID,
-				SecretAccessKey: secretAccessKey,
-			}),
-		}))
+		config.Credentials = credentials.NewStaticCredentialsFromCreds(credentials.Value{
+			AccessKeyID:     accessKeyID,
+			SecretAccessKey: secretAccessKey,
+		})
 	}
 
-	return ec2.New(session.New(&aws.Config{
-		Region: aws.String(d.AWSMachineClass.Spec.Region),
-	}))
+	s, err := session.NewSession(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return ec2.New(s), nil
 }
 
 func (d *AWSDriver) encodeMachineID(region, machineID string) string {
@@ -304,4 +478,79 @@ func (d *AWSDriver) encodeMachineID(region, machineID string) string {
 func (d *AWSDriver) decodeMachineID(id string) string {
 	splitProviderID := strings.Split(id, "/")
 	return splitProviderID[len(splitProviderID)-1]
+}
+
+// GetVolNames parses volume names from pv specs
+func (d *AWSDriver) GetVolNames(specs []corev1.PersistentVolumeSpec) ([]string, error) {
+	names := []string{}
+	for i := range specs {
+		spec := &specs[i]
+		if spec.AWSElasticBlockStore != nil {
+			name, err := kubernetesVolumeIDToEBSVolumeID(spec.AWSElasticBlockStore.VolumeID)
+			if err != nil {
+				klog.Errorf("Failed to translate Kubernetes volume ID '%s' to EBS volume ID: %v", spec.AWSElasticBlockStore.VolumeID, err)
+				continue
+			}
+
+			names = append(names, name)
+		} else if spec.CSI != nil && spec.CSI.Driver == awsEBSDriverName && spec.CSI.VolumeHandle != "" {
+			name := spec.CSI.VolumeHandle
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+//GetUserData return the used data whit which the VM will be booted
+func (d *AWSDriver) GetUserData() string {
+	return d.UserData
+}
+
+//SetUserData set the used data whit which the VM will be booted
+func (d *AWSDriver) SetUserData(userData string) {
+	d.UserData = userData
+}
+
+// awsVolumeRegMatch represents Regex Match for AWS volume.
+var awsVolumeRegMatch = regexp.MustCompile("^vol-[^/]*$")
+
+// kubernetesVolumeIDToEBSVolumeID translates Kubernetes volume ID to EBS volume ID
+// KubernetsVolumeID forms:
+//  * aws://<zone>/<awsVolumeId>
+//  * aws:///<awsVolumeId>
+//  * <awsVolumeId>
+// EBS Volume ID form:
+//  * vol-<alphanumberic>
+func kubernetesVolumeIDToEBSVolumeID(kubernetesID string) (string, error) {
+	// name looks like aws://availability-zone/awsVolumeId
+
+	// The original idea of the URL-style name was to put the AZ into the
+	// host, so we could find the AZ immediately from the name without
+	// querying the API.  But it turns out we don't actually need it for
+	// multi-AZ clusters, as we put the AZ into the labels on the PV instead.
+	// However, if in future we want to support multi-AZ cluster
+	// volume-awareness without using PersistentVolumes, we likely will
+	// want the AZ in the host.
+	if !strings.HasPrefix(kubernetesID, "aws://") {
+		// Assume a bare aws volume id (vol-1234...)
+		return kubernetesID, nil
+	}
+	url, err := url.Parse(kubernetesID)
+	if err != nil {
+		return "", fmt.Errorf("invalid disk name (%s): %v", kubernetesID, err)
+	}
+	if url.Scheme != "aws" {
+		return "", fmt.Errorf("invalid scheme for AWS volume (%s)", kubernetesID)
+	}
+
+	awsID := url.Path
+	awsID = strings.Trim(awsID, "/")
+
+	// We sanity check the resulting volume; the two known formats are
+	// vol-12345678 and vol-12345678abcdef01
+	if !awsVolumeRegMatch.MatchString(awsID) {
+		return "", fmt.Errorf("invalid format for AWS volume (%s)", kubernetesID)
+	}
+
+	return awsID, nil
 }

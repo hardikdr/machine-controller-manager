@@ -18,9 +18,8 @@ package controller
 
 import (
 	"fmt"
-	"time"
-
 	"testing"
+	"time"
 
 	machine_internal "github.com/gardener/machine-controller-manager/pkg/apis/machine"
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
@@ -33,10 +32,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
 	coreinformers "k8s.io/client-go/informers"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog"
+	"k8s.io/utils/pointer"
 )
 
 func TestMachineControllerManagerSuite(t *testing.T) {
@@ -46,22 +50,125 @@ func TestMachineControllerManagerSuite(t *testing.T) {
 
 var (
 	controllerKindMachine = v1alpha1.SchemeGroupVersion.WithKind("Machine")
+	AWSMachineClass       = "AWSMachineClass"
+	TestMachineClass      = "machineClass-0"
 )
 
-func newMachineSetFromMachineDeployment(machineSetCount int, machineDeployment *v1alpha1.MachineDeployment, replicas int32, statusTemplate *v1alpha1.MachineSetStatus) *v1alpha1.MachineSet {
-	return newMachineSetsFromMachineDeployment(1, machineDeployment, replicas, statusTemplate)[0]
+func newMachineDeployment(
+	specTemplate *v1alpha1.MachineTemplateSpec,
+	replicas int32,
+	minReadySeconds int32,
+	statusTemplate *v1alpha1.MachineDeploymentStatus,
+	owner *metav1.OwnerReference,
+	annotations map[string]string,
+	labels map[string]string,
+) *v1alpha1.MachineDeployment {
+	return newMachineDeployments(1, specTemplate, replicas, minReadySeconds, statusTemplate, owner, annotations, labels)[0]
 }
 
-func newMachineSetsFromMachineDeployment(machineSetCount int, machineDeployment *v1alpha1.MachineDeployment, replicas int32, statusTemplate *v1alpha1.MachineSetStatus) []*v1alpha1.MachineSet {
+func newMachineDeployments(
+	machineDeploymentCount int,
+	specTemplate *v1alpha1.MachineTemplateSpec,
+	replicas int32,
+	minReadySeconds int32,
+	statusTemplate *v1alpha1.MachineDeploymentStatus,
+	owner *metav1.OwnerReference,
+	annotations map[string]string,
+	labels map[string]string,
+) []*v1alpha1.MachineDeployment {
+
+	intStr1 := intstr.FromInt(1)
+	machineDeployments := make([]*v1alpha1.MachineDeployment, machineDeploymentCount)
+	for i := range machineDeployments {
+		machineDeployment := &v1alpha1.MachineDeployment{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "machine.sapcloud.io",
+				Kind:       "MachineDeployment",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("machinedeployment-%d", i),
+				Namespace: testNamespace,
+				Labels:    labels,
+			},
+			Spec: v1alpha1.MachineDeploymentSpec{
+				MinReadySeconds: minReadySeconds,
+				Replicas:        replicas,
+				Selector: &metav1.LabelSelector{
+					MatchLabels: deepCopy(specTemplate.ObjectMeta.Labels),
+				},
+				Strategy: v1alpha1.MachineDeploymentStrategy{
+					RollingUpdate: &v1alpha1.RollingUpdateMachineDeployment{
+						MaxSurge:       &intStr1,
+						MaxUnavailable: &intStr1,
+					},
+				},
+				Template: *specTemplate.DeepCopy(),
+			},
+		}
+
+		if statusTemplate != nil {
+			machineDeployment.Status = *statusTemplate.DeepCopy()
+		}
+
+		if owner != nil {
+			machineDeployment.OwnerReferences = append(machineDeployment.OwnerReferences, *owner.DeepCopy())
+		}
+
+		if annotations != nil {
+			machineDeployment.Annotations = annotations
+		}
+
+		machineDeployments[i] = machineDeployment
+	}
+	return machineDeployments
+}
+
+func newMachineSetFromMachineDeployment(
+	machineDeployment *v1alpha1.MachineDeployment,
+	replicas int32,
+	statusTemplate *v1alpha1.MachineSetStatus,
+	annotations map[string]string,
+	labels map[string]string,
+) *v1alpha1.MachineSet {
+	return newMachineSetsFromMachineDeployment(1, machineDeployment, replicas, statusTemplate, annotations, labels)[0]
+}
+
+func newMachineSetsFromMachineDeployment(
+	machineSetCount int,
+	machineDeployment *v1alpha1.MachineDeployment,
+	replicas int32,
+	statusTemplate *v1alpha1.MachineSetStatus,
+	annotations map[string]string,
+	labels map[string]string,
+) []*v1alpha1.MachineSet {
+
+	finalLabels := make(map[string]string)
+	for k, v := range labels {
+		finalLabels[k] = v
+	}
+	for k, v := range machineDeployment.Spec.Template.Labels {
+		finalLabels[k] = v
+	}
+
 	t := &machineDeployment.TypeMeta
-	return newMachineSets(machineSetCount, &machineDeployment.Spec.Template, replicas, machineDeployment.Spec.MinReadySeconds, statusTemplate, &metav1.OwnerReference{
-		APIVersion:         t.APIVersion,
-		Kind:               t.Kind,
-		Name:               machineDeployment.Name,
-		UID:                machineDeployment.UID,
-		BlockOwnerDeletion: boolPtr(true),
-		Controller:         boolPtr(true),
-	}, nil)
+
+	return newMachineSets(
+		machineSetCount,
+		&machineDeployment.Spec.Template,
+		replicas,
+		machineDeployment.Spec.MinReadySeconds,
+		statusTemplate,
+		&metav1.OwnerReference{
+			APIVersion:         t.APIVersion,
+			Kind:               t.Kind,
+			Name:               machineDeployment.Name,
+			UID:                machineDeployment.UID,
+			BlockOwnerDeletion: pointer.BoolPtr(true),
+			Controller:         pointer.BoolPtr(true),
+		},
+		annotations,
+		finalLabels,
+	)
 }
 
 func newMachineSet(
@@ -71,8 +178,9 @@ func newMachineSet(
 	statusTemplate *v1alpha1.MachineSetStatus,
 	owner *metav1.OwnerReference,
 	annotations map[string]string,
+	labels map[string]string,
 ) *v1alpha1.MachineSet {
-	return newMachineSets(1, specTemplate, replicas, minReadySeconds, statusTemplate, owner, annotations)[0]
+	return newMachineSets(1, specTemplate, replicas, minReadySeconds, statusTemplate, owner, annotations, labels)[0]
 }
 
 func newMachineSets(
@@ -83,6 +191,7 @@ func newMachineSets(
 	statusTemplate *v1alpha1.MachineSetStatus,
 	owner *metav1.OwnerReference,
 	annotations map[string]string,
+	labels map[string]string,
 ) []*v1alpha1.MachineSet {
 
 	machineSets := make([]*v1alpha1.MachineSet, machineSetCount)
@@ -95,7 +204,7 @@ func newMachineSets(
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("machineset-%d", i),
 				Namespace: testNamespace,
-				Labels:    make(map[string]string, 0),
+				Labels:    labels,
 			},
 			Spec: v1alpha1.MachineSetSpec{
 				MachineClass:    *specTemplate.Spec.Class.DeepCopy(),
@@ -133,28 +242,76 @@ func deepCopy(m map[string]string) map[string]string {
 	return r
 }
 
-func newMachineFromMachineSet(machineSet *v1alpha1.MachineSet, statusTemplate *v1alpha1.MachineStatus) *v1alpha1.Machine {
-	return newMachinesFromMachineSet(1, machineSet, statusTemplate)[0]
+func newMachineFromMachineSet(
+	machineSet *v1alpha1.MachineSet,
+	statusTemplate *v1alpha1.MachineStatus,
+	annotations map[string]string,
+	labels map[string]string,
+) *v1alpha1.Machine {
+	return newMachinesFromMachineSet(1, machineSet, statusTemplate, annotations, labels)[0]
 }
 
-func newMachinesFromMachineSet(machineCount int, machineSet *v1alpha1.MachineSet, statusTemplate *v1alpha1.MachineStatus) []*v1alpha1.Machine {
-	t := machineSet.TypeMeta
-	return newMachines(machineCount, &machineSet.Spec.Template, statusTemplate, &metav1.OwnerReference{
-		APIVersion:         t.APIVersion,
-		Kind:               t.Kind,
-		Name:               machineSet.Name,
-		UID:                machineSet.UID,
-		BlockOwnerDeletion: boolPtr(true),
-		Controller:         boolPtr(true),
-	})
+func newMachinesFromMachineSet(
+	machineCount int,
+	machineSet *v1alpha1.MachineSet,
+	statusTemplate *v1alpha1.MachineStatus,
+	annotations map[string]string,
+	labels map[string]string,
+) []*v1alpha1.Machine {
+	t := &machineSet.TypeMeta
+
+	finalLabels := make(map[string]string, 0)
+	for k, v := range labels {
+		finalLabels[k] = v
+	}
+	for k, v := range machineSet.Spec.Template.Labels {
+		finalLabels[k] = v
+	}
+
+	return newMachines(
+		machineCount,
+		&machineSet.Spec.Template,
+		statusTemplate,
+		&metav1.OwnerReference{
+			APIVersion:         t.APIVersion,
+			Kind:               t.Kind,
+			Name:               machineSet.Name,
+			UID:                machineSet.UID,
+			BlockOwnerDeletion: pointer.BoolPtr(true),
+			Controller:         pointer.BoolPtr(true),
+		},
+		annotations,
+		finalLabels,
+	)
 }
 
-func newMachine(specTemplate *v1alpha1.MachineTemplateSpec, statusTemplate *v1alpha1.MachineStatus, owner *metav1.OwnerReference) *v1alpha1.Machine {
-	return newMachines(1, specTemplate, statusTemplate, owner)[0]
+func newMachine(
+	specTemplate *v1alpha1.MachineTemplateSpec,
+	statusTemplate *v1alpha1.MachineStatus,
+	owner *metav1.OwnerReference,
+	annotations map[string]string,
+	labels map[string]string,
+) *v1alpha1.Machine {
+	return newMachines(1, specTemplate, statusTemplate, owner, annotations, labels)[0]
 }
 
-func newMachines(machineCount int, specTemplate *v1alpha1.MachineTemplateSpec, statusTemplate *v1alpha1.MachineStatus, owner *metav1.OwnerReference) []*v1alpha1.Machine {
+func newMachines(
+	machineCount int,
+	specTemplate *v1alpha1.MachineTemplateSpec,
+	statusTemplate *v1alpha1.MachineStatus,
+	owner *metav1.OwnerReference,
+	annotations map[string]string,
+	labels map[string]string,
+) []*v1alpha1.Machine {
 	machines := make([]*v1alpha1.Machine, machineCount)
+
+	if annotations == nil {
+		annotations = make(map[string]string, 0)
+	}
+	if labels == nil {
+		labels = make(map[string]string, 0)
+	}
+
 	for i := range machines {
 		m := &v1alpha1.Machine{
 			TypeMeta: metav1.TypeMeta{
@@ -162,9 +319,11 @@ func newMachines(machineCount int, specTemplate *v1alpha1.MachineTemplateSpec, s
 				Kind:       "Machine",
 			},
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("machine-%d", i),
-				Namespace: testNamespace,
-				Labels:    make(map[string]string, 0),
+				Name:              fmt.Sprintf("machine-%d", i),
+				Namespace:         testNamespace,
+				Labels:            labels,
+				Annotations:       annotations,
+				CreationTimestamp: metav1.Now(),
 			},
 			Spec: *newMachineSpec(&specTemplate.Spec, i),
 		}
@@ -182,7 +341,7 @@ func newMachines(machineCount int, specTemplate *v1alpha1.MachineTemplateSpec, s
 	return machines
 }
 
-func nodeNodes(
+func newNode(
 	nodeCount int,
 	nodeSpec *corev1.NodeSpec,
 	nodeStatus *corev1.NodeStatus,
@@ -212,10 +371,6 @@ func newNodes(
 		nodes[i] = node
 	}
 	return nodes
-}
-
-func boolPtr(b bool) *bool {
-	return &b
 }
 
 func newObjectMeta(meta *metav1.ObjectMeta, index int) *metav1.ObjectMeta {
@@ -305,6 +460,18 @@ func createController(
 	defer coreTargetInformerFactory.Start(stop)
 	coreTargetSharedInformers := coreTargetInformerFactory.Core().V1()
 	nodes := coreTargetSharedInformers.Nodes()
+	pvcs := coreTargetSharedInformers.PersistentVolumeClaims()
+	pvs := coreTargetSharedInformers.PersistentVolumes()
+
+	coreControlInformerFactory := coreinformers.NewFilteredSharedInformerFactory(
+		fakeControlCoreClient,
+		100*time.Millisecond,
+		namespace,
+		nil,
+	)
+	defer coreControlInformerFactory.Start(stop)
+	coreControlSharedInformers := coreControlInformerFactory.Core().V1()
+	secret := coreControlSharedInformers.Secrets()
 
 	controlMachineInformerFactory := machineinformers.NewFilteredSharedInformerFactory(
 		fakeControlMachineClient,
@@ -339,7 +506,7 @@ func createController(
 		MachineSafetyAPIServerStatusCheckTimeout: metav1.Duration{Duration: 30 * time.Second},
 	}
 
-	return &controller{
+	controller := &controller{
 		namespace:                      namespace,
 		safetyOptions:                  safetyOptions,
 		awsMachineClassLister:          aws.Lister(),
@@ -352,12 +519,17 @@ func createController(
 		controlMachineClient:           fakeTypedMachineClient,
 		internalExternalScheme:         internalExternalScheme,
 		nodeLister:                     nodes.Lister(),
+		pvcLister:                      pvcs.Lister(),
+		pvLister:                       pvs.Lister(),
+		secretLister:                   secret.Lister(),
 		machineLister:                  machines.Lister(),
 		machineSetLister:               machineSets.Lister(),
 		machineDeploymentLister:        machineDeployments.Lister(),
 		machineSynced:                  machines.Informer().HasSynced,
 		machineSetSynced:               machineSets.Informer().HasSynced,
 		machineDeploymentSynced:        machineDeployments.Informer().HasSynced,
+		nodeSynced:                     nodes.Informer().HasSynced,
+		secretSynced:                   secret.Informer().HasSynced,
 		secretQueue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "secret"),
 		nodeQueue:                      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "node"),
 		openStackMachineClassQueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "openstackmachineclass"),
@@ -370,7 +542,22 @@ func createController(
 		machineSafetyOrphanVMsQueue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyorphanvms"),
 		machineSafetyOvershootingQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyovershooting"),
 		machineSafetyAPIServerQueue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "machinesafetyapiserver"),
-	}, fakeObjectTrackers
+		expectations:                   NewUIDTrackingContExpectations(NewContExpectations()),
+		recorder:                       record.NewBroadcaster().NewRecorder(nil, corev1.EventSource{Component: ""}),
+		deleteMigratedMachineClass:     true,
+	}
+
+	// controller.internalExternalScheme = runtime.NewScheme()
+
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartLogging(klog.Infof)
+	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(fakeControlCoreClient.CoreV1().RESTClient()).Events(namespace)})
+
+	controller.machineControl = FakeMachineControl{
+		controlMachineClient: fakeTypedMachineClient,
+	}
+
+	return controller, fakeObjectTrackers
 }
 
 func waitForCacheSync(stop <-chan struct{}, controller *controller) {
@@ -380,6 +567,7 @@ func waitForCacheSync(stop <-chan struct{}, controller *controller) {
 		controller.machineSynced,
 		controller.machineSetSynced,
 		controller.machineDeploymentSynced,
+		controller.nodeSynced,
 	)).To(BeTrue())
 }
 
@@ -392,7 +580,7 @@ var _ = Describe("#createController", func() {
 	It("success", func() {
 		machine0 := newMachine(&v1alpha1.MachineTemplateSpec{
 			ObjectMeta: *objMeta,
-		}, nil, nil)
+		}, nil, nil, nil, nil)
 
 		stop := make(chan struct{})
 		defer close(stop)

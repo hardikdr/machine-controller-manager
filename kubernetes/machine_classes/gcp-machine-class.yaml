@@ -17,6 +17,13 @@ spec:
     image: projects/coreos-cloud/global/images/image-name-goes-here # Disk image name
     labels:
       name: my-disk # Label assigned to the disk
+  - autoDelete: true
+    boot: false
+    sizeGb: 50
+    type: pd-standard
+    image: projects/coreos-cloud/global/images/image-name-goes-here # Disk image name
+    labels:
+      name: my-disk
   labels:
     name: my-instance # Label assigned to the instance
   machineType: n1-standard-4 # Type of GCP instance to launch
@@ -24,7 +31,8 @@ spec:
   - key: my-key
     value: my-value
   networkInterfaces:
-  - network: network-name # Network name to attach the instance to
+  - disableExternalIP: false # If external IP is not required for the NIC, set this to true
+    network: network-name # Network name to attach the instance to
     subnetwork: sub-net-name # Subnet name to attach the instance to
   scheduling:
     automaticRestart: true # Automatic restart of instance

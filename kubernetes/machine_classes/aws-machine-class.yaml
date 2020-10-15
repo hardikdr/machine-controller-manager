@@ -25,6 +25,15 @@ spec:
     namespace: default  # Namespace
     name: test-secret # Name of the secret
   blockDevices:
-    - ebs:
+    - deviceName: /root
+      ebs:
         volumeSize: 50  # Size of the root block device
         volumeType: gp2 # Type of the root block device
+        encrypted: false
+        deleteOnTermination: true
+    - deviceName: /dev/sdb
+      ebs:
+        volumeSize: 50  # Size of the root block device
+        volumeType: gp2 # Type of the root block device
+        encrypted: true
+        deleteOnTermination: true

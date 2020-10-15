@@ -17,13 +17,14 @@ limitations under the License.
 package fakeclient
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
-	"errors"
-
 	fakeuntyped "github.com/gardener/machine-controller-manager/pkg/client/clientset/versioned/fake"
+	apipolicyv1beta1 "k8s.io/api/policy/v1beta1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -32,7 +33,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	serializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/discovery"
+	fakediscovery "k8s.io/client-go/discovery/fake"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	policyv1beta1 "k8s.io/client-go/kubernetes/typed/policy/v1beta1"
+	fakepolicyv1beta1 "k8s.io/client-go/kubernetes/typed/policy/v1beta1/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -45,7 +50,7 @@ type FakeObjectTracker struct {
 	fakingOptions
 }
 
-// Add recieves an add event with the object
+// Add receives an add event with the object
 func (t *FakeObjectTracker) Add(obj runtime.Object) error {
 	if t.fakingEnabled {
 		err := t.RunFakeInvocations()
@@ -57,21 +62,32 @@ func (t *FakeObjectTracker) Add(obj runtime.Object) error {
 	return t.delegatee.Add(obj)
 }
 
-// Get recieves an get event with the object
+// Get receives an get event with the object
 func (t *FakeObjectTracker) Get(gvr schema.GroupVersionResource, ns, name string) (runtime.Object, error) {
 	if t.fakingEnabled {
+		defer t.DecrementCounter()
+
 		err := t.RunFakeInvocations()
 		if err != nil {
 			return nil, err
 		}
+
+		if gvr.Resource == "machines" {
+			if t.fakingOptions.failAt.Machine.Get != nil {
+				return nil, t.fakingOptions.failAt.Machine.Get
+			}
+		}
+
 	}
 
 	return t.delegatee.Get(gvr, ns, name)
 }
 
-// Create recieves an create event with the object
+// Create receives an create event with the object
 func (t *FakeObjectTracker) Create(gvr schema.GroupVersionResource, obj runtime.Object, ns string) error {
 	if t.fakingEnabled {
+		defer t.DecrementCounter()
+
 		err := t.RunFakeInvocations()
 		if err != nil {
 			return err
@@ -95,12 +111,21 @@ func (t *FakeObjectTracker) Create(gvr schema.GroupVersionResource, obj runtime.
 	return nil
 }
 
-// Update recieves an update event with the object
+// Update receives an update event with the object
 func (t *FakeObjectTracker) Update(gvr schema.GroupVersionResource, obj runtime.Object, ns string) error {
+
 	if t.fakingEnabled {
+		defer t.DecrementCounter()
+
 		err := t.RunFakeInvocations()
 		if err != nil {
 			return err
+		}
+
+		if gvr.Resource == "nodes" {
+			if t.fakingOptions.failAt.Node.Update != "" {
+				return errors.New(t.fakingOptions.failAt.Node.Update)
+			}
 		}
 	}
 
@@ -121,9 +146,11 @@ func (t *FakeObjectTracker) Update(gvr schema.GroupVersionResource, obj runtime.
 	return nil
 }
 
-// List recieves an list event with the object
+// List receives an list event with the object
 func (t *FakeObjectTracker) List(gvr schema.GroupVersionResource, gvk schema.GroupVersionKind, ns string) (runtime.Object, error) {
 	if t.fakingEnabled {
+		defer t.DecrementCounter()
+
 		err := t.RunFakeInvocations()
 		if err != nil {
 			return nil, err
@@ -132,9 +159,11 @@ func (t *FakeObjectTracker) List(gvr schema.GroupVersionResource, gvk schema.Gro
 	return t.delegatee.List(gvr, gvk, ns)
 }
 
-// Delete recieves an delete event with the object
+// Delete receives an delete event with the object
 func (t *FakeObjectTracker) Delete(gvr schema.GroupVersionResource, ns, name string) error {
 	if t.fakingEnabled {
+		defer t.DecrementCounter()
+
 		err := t.RunFakeInvocations()
 		if err != nil {
 			return err
@@ -163,9 +192,11 @@ func (t *FakeObjectTracker) Delete(gvr schema.GroupVersionResource, ns, name str
 	return nil
 }
 
-// Watch recieves an watch event with the object
+// Watch receives an watch event with the object
 func (t *FakeObjectTracker) Watch(gvr schema.GroupVersionResource, name string) (watch.Interface, error) {
 	if t.fakingEnabled {
+		defer t.DecrementCounter()
+
 		err := t.RunFakeInvocations()
 		if err != nil {
 			return nil, err
@@ -316,17 +347,39 @@ func (w *watcher) dispatchInitialObjects(action k8stesting.WatchAction, t k8stes
 	return nil
 }
 
+// ResourceActions contains of Kubernetes/Machine resources whose response can be faked
+type ResourceActions struct {
+	Node    Actions
+	Machine Actions
+}
+
+// Actions contains the actions whose response can be faked
+type Actions struct {
+	Create string
+	Get    error
+	Delete string
+	Update string
+}
+
 // fakingOptions are options that can be set while trying to fake object tracker returns
 type fakingOptions struct {
+	// To check if faking is enabled
 	fakingEnabled bool
-	errorMessage  string
-	delay         time.Duration
+	// Number of times faking is to occur
+	counter int
+	// Error message to be displayed
+	errorMessage string
+	// Delay in providing response
+	delay time.Duration
+	// Fail at different resource action
+	failAt *ResourceActions
 }
 
 // SetDelay sets delay while invoking any interface exposed by standard ObjectTrackers
 func (o *fakingOptions) SetDelay(delay time.Duration) error {
 	o.fakingEnabled = true
 	o.delay = delay
+	o.counter = math.MaxInt32
 	return nil
 }
 
@@ -334,22 +387,44 @@ func (o *fakingOptions) SetDelay(delay time.Duration) error {
 func (o *fakingOptions) SetError(message string) error {
 	o.fakingEnabled = true
 	o.errorMessage = message
+	o.counter = math.MaxInt32
+	return nil
+}
+
+// SetFakeResourceActions sets up the errorMessage to be returned on specific calls
+func (o *fakingOptions) SetFakeResourceActions(resourceActions *ResourceActions, counter int) error {
+	o.fakingEnabled = true
+	o.failAt = resourceActions
+	o.counter = counter
 	return nil
 }
 
 // ClearOptions clears any faking options that have been sets
-func (o *fakingOptions) ClearOptions(message string) error {
+func (o *fakingOptions) ClearOptions() error {
 	o.fakingEnabled = false
 	o.errorMessage = ""
 	o.delay = 0
+	o.failAt = nil
+	o.counter = 0
+	return nil
+}
+
+func (o *fakingOptions) DecrementCounter() error {
+	o.counter--
+	if o.counter == 0 {
+		o.ClearOptions()
+	}
 	return nil
 }
 
 // RunFakeInvocations runs any custom fake configurations/methods before invoking standard ObjectTrackers
 func (o *fakingOptions) RunFakeInvocations() error {
+	// Delay while returning call
 	if o.delay != 0 {
 		time.Sleep(o.delay)
 	}
+
+	// If error message has been set
 	if o.errorMessage != "" {
 		return errors.New(o.errorMessage)
 	}
@@ -425,7 +500,7 @@ func (o *FakeObjectTrackers) Stop() error {
 // It's backed by a very simple object tracker that processes creates, updates and deletions as-is,
 // without applying any validations and/or defaults. It shouldn't be considered a replacement
 // for a real clientset and is mostly useful in simple unit tests.
-func NewCoreClientSet(objects ...runtime.Object) (*k8sfake.Clientset, *FakeObjectTracker) {
+func NewCoreClientSet(objects ...runtime.Object) (*Clientset, *FakeObjectTracker) {
 
 	var scheme = runtime.NewScheme()
 	var codecs = serializer.NewCodecFactory(scheme)
@@ -444,9 +519,76 @@ func NewCoreClientSet(objects ...runtime.Object) (*k8sfake.Clientset, *FakeObjec
 		}
 	}
 
-	cs := &k8sfake.Clientset{}
+	cs := &Clientset{Clientset: &k8sfake.Clientset{}}
+	cs.FakeDiscovery = &fakediscovery.FakeDiscovery{Fake: &cs.Fake}
 	cs.Fake.AddReactor("*", "*", k8stesting.ObjectReaction(o))
 	cs.Fake.AddWatchReactor("*", o.watchReactionfunc)
 
 	return cs, o
+}
+
+// Clientset extends k8sfake.Clientset to override the Policy implementation.
+// This is because the default Policy fake implementation does not propagate the
+// eviction name.
+type Clientset struct {
+	*k8sfake.Clientset
+	FakeDiscovery *fakediscovery.FakeDiscovery
+}
+
+// Discovery returns the fake discovery implementation.
+func (c *Clientset) Discovery() discovery.DiscoveryInterface {
+	return c.FakeDiscovery
+}
+
+// PolicyV1beta1 retrieves the PolicyV1beta1Client
+func (c *Clientset) PolicyV1beta1() policyv1beta1.PolicyV1beta1Interface {
+	return &FakePolicyV1beta1{
+		FakePolicyV1beta1: &fakepolicyv1beta1.FakePolicyV1beta1{
+			Fake: &c.Fake,
+		},
+	}
+}
+
+// Policy retrieves the PolicyV1beta1Client
+func (c *Clientset) Policy() policyv1beta1.PolicyV1beta1Interface {
+	return c.PolicyV1beta1()
+}
+
+// FakePolicyV1beta1 extends fakepolicyv1beta1.FakePolicyV1beta1 to override the
+// Policy implementation. This is because the default Policy fake implementation
+// does not propagate the eviction name.
+type FakePolicyV1beta1 struct {
+	*fakepolicyv1beta1.FakePolicyV1beta1
+}
+
+// Evictions extends fakepolicyv1beta1.FakeEvictions to override the
+// Policy implementation. This is because the default Policy fake implementation
+// does not propagate the eviction name.
+func (c *FakePolicyV1beta1) Evictions(namespace string) policyv1beta1.EvictionInterface {
+	return &FakeEvictions{
+		FakePolicyV1beta1: c.FakePolicyV1beta1,
+		ns:                namespace,
+	}
+}
+
+// FakeEvictions extends fakepolicyv1beta1.FakeEvictions to override the
+// Policy implementation. This is because the default Policy fake implementation
+// does not propagate the eviction name.
+type FakeEvictions struct {
+	*fakepolicyv1beta1.FakePolicyV1beta1
+	ns string
+}
+
+// Evict overrides the fakepolicyv1beta1.FakeEvictions to override the
+// Policy implementation. This is because the default Policy fake implementation
+// does not propagate the eviction name.
+func (c *FakeEvictions) Evict(eviction *apipolicyv1beta1.Eviction) error {
+	action := k8stesting.GetActionImpl{}
+	action.Name = eviction.Name
+	action.Verb = "post"
+	action.Namespace = c.ns
+	action.Resource = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	action.Subresource = "eviction"
+	_, err := c.Fake.Invokes(action, eviction)
+	return err
 }

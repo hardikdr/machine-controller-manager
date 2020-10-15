@@ -34,17 +34,17 @@ import (
 
 	machinescheme "github.com/gardener/machine-controller-manager/pkg/client/clientset/versioned/scheme"
 	machineinformers "github.com/gardener/machine-controller-manager/pkg/client/informers/externalversions"
-	machinecontroller "github.com/gardener/machine-controller-manager/pkg/controller"
-	corecontroller "github.com/gardener/machine-controller-manager/pkg/util/controller"
+	mcmcontroller "github.com/gardener/machine-controller-manager/pkg/controller"
+	corecontroller "github.com/gardener/machine-controller-manager/pkg/util/clientbuilder/core"
+	machinecontroller "github.com/gardener/machine-controller-manager/pkg/util/clientbuilder/machine"
 	coreinformers "k8s.io/client-go/informers"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
 
 	"github.com/gardener/machine-controller-manager/cmd/machine-controller-manager/app/options"
 	"github.com/gardener/machine-controller-manager/pkg/handlers"
 	"github.com/gardener/machine-controller-manager/pkg/util/configz"
-	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -57,24 +57,23 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/klog"
 )
 
 const (
-	controllerManagerAgentName   = "machine-controller-manager"
-	controllerDiscoveryAgentName = "machine-controller-discovery"
+	controllerManagerAgentName = "machine-controller-manager"
 )
 
-var openStackGVR = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "openstackmachineclasses"}
-var awsGVR = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "awsmachineclasses"}
-var azureGVR = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "azuremachineclasses"}
-var gcpGVR = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "gcpmachineclasses"}
-var alicloudGVR = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "alicloudmachineclasses"}
-var packetGVR = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "packetmachineclasses"}
+var (
+	machineGVR           = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "machines"}
+	machineSetGVR        = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "machinesets"}
+	machineDeploymentGVR = schema.GroupVersionResource{Group: "machine.sapcloud.io", Version: "v1alpha1", Resource: "machinedeployments"}
+)
 
 // Run runs the MCMServer.  This should never exit.
 func Run(s *options.MCMServer) error {
 	// To help debugging, immediately log version
-	glog.V(4).Infof("Version: %+v", version.Get())
+	klog.V(4).Infof("Version: %+v", version.Get())
 	if err := s.Validate(); err != nil {
 		return err
 	}
@@ -114,11 +113,11 @@ func Run(s *options.MCMServer) error {
 		rest.AddUserAgent(controlkubeconfig, "machine-controller-manager"),
 	)
 	if err != nil {
-		glog.Fatalf("Invalid API configuration for kubeconfig-control: %v", err)
+		klog.Fatalf("Invalid API configuration for kubeconfig-control: %v", err)
 	}
 
 	leaderElectionClient := kubernetes.NewForConfigOrDie(rest.AddUserAgent(controlkubeconfig, "machine-leader-election"))
-	glog.V(4).Info("Starting http server and mux")
+	klog.V(4).Info("Starting http server and mux")
 	go startHTTP(s)
 
 	recorder := createRecorder(kubeClientControl)
@@ -149,7 +148,7 @@ func Run(s *options.MCMServer) error {
 			stop,
 		)
 
-		glog.Fatalf("error running controllers: %v", err)
+		klog.Fatalf("error running controllers: %v", err)
 		panic("unreachable")
 
 	}
@@ -164,16 +163,19 @@ func Run(s *options.MCMServer) error {
 		return err
 	}
 
-	rl, err := resourcelock.New(s.LeaderElection.ResourceLock,
+	rl, err := resourcelock.New(
+		s.LeaderElection.ResourceLock,
 		s.Namespace,
 		"machine-controller-manager",
 		leaderElectionClient.CoreV1(),
+		leaderElectionClient.CoordinationV1(),
 		resourcelock.ResourceLockConfig{
 			Identity:      id,
 			EventRecorder: recorder,
-		})
+		},
+	)
 	if err != nil {
-		glog.Fatalf("error creating lock: %v", err)
+		klog.Fatalf("error creating lock: %v", err)
 	}
 
 	ctx := context.TODO()
@@ -185,7 +187,7 @@ func Run(s *options.MCMServer) error {
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: run,
 			OnStoppedLeading: func() {
-				glog.Fatalf("leaderelection lost")
+				klog.Fatalf("leaderelection lost")
 			},
 		},
 	})
@@ -202,7 +204,7 @@ func StartControllers(s *options.MCMServer,
 	recorder record.EventRecorder,
 	stop <-chan struct{}) error {
 
-	glog.V(5).Info("Getting available resources")
+	klog.V(5).Info("Getting available resources")
 	availableResources, err := getAvailableResources(controlCoreClientBuilder)
 	if err != nil {
 		return err
@@ -213,17 +215,17 @@ func StartControllers(s *options.MCMServer,
 	controlCoreKubeconfig = rest.AddUserAgent(controlCoreKubeconfig, controllerManagerAgentName)
 	controlCoreClient, err := kubernetes.NewForConfig(controlCoreKubeconfig)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 
 	targetCoreKubeconfig = rest.AddUserAgent(targetCoreKubeconfig, controllerManagerAgentName)
 	targetCoreClient, err := kubernetes.NewForConfig(targetCoreKubeconfig)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 
-	if availableResources[awsGVR] || availableResources[azureGVR] || availableResources[gcpGVR] || availableResources[openStackGVR] || availableResources[alicloudGVR] || availableResources[packetGVR] {
-		glog.V(5).Infof("Creating shared informers; resync interval: %v", s.MinResyncPeriod)
+	if availableResources[machineGVR] || availableResources[machineSetGVR] || availableResources[machineDeploymentGVR] {
+		klog.V(5).Infof("Creating shared informers; resync interval: %v", s.MinResyncPeriod)
 
 		controlMachineInformerFactory := machineinformers.NewFilteredSharedInformerFactory(
 			controlMachineClientBuilder.ClientOrDie("control-machine-shared-informers"),
@@ -247,12 +249,14 @@ func StartControllers(s *options.MCMServer,
 		// All shared informers are v1alpha1 API level
 		machineSharedInformers := controlMachineInformerFactory.Machine().V1alpha1()
 
-		glog.V(5).Infof("Creating controllers...")
-		machineController, err := machinecontroller.NewController(
+		klog.V(5).Infof("Creating controllers...")
+		mcmcontroller, err := mcmcontroller.NewController(
 			s.Namespace,
 			controlMachineClient,
 			controlCoreClient,
 			targetCoreClient,
+			targetCoreInformerFactory.Core().V1().PersistentVolumeClaims(),
+			targetCoreInformerFactory.Core().V1().PersistentVolumes(),
 			controlCoreInformerFactory.Core().V1().Secrets(),
 			targetCoreInformerFactory.Core().V1().Nodes(),
 			machineSharedInformers.OpenStackMachineClasses(),
@@ -266,21 +270,25 @@ func StartControllers(s *options.MCMServer,
 			machineSharedInformers.MachineDeployments(),
 			recorder,
 			s.SafetyOptions,
+			s.NodeConditions,
+			s.BootstrapTokenAuthExtraGroups,
+			s.DeleteMigratedMachineClass,
+			s.AutoscalerScaleDownAnnotationDuringRollout,
 		)
 		if err != nil {
 			return err
 		}
-		glog.V(1).Info("Starting shared informers")
+		klog.V(1).Info("Starting shared informers")
 
 		controlMachineInformerFactory.Start(stop)
 		controlCoreInformerFactory.Start(stop)
 		targetCoreInformerFactory.Start(stop)
 
-		glog.V(5).Info("Running controller")
-		go machineController.Run(int(s.ConcurrentNodeSyncs), stop)
+		klog.V(5).Info("Running controller")
+		go mcmcontroller.Run(int(s.ConcurrentNodeSyncs), stop)
 
 	} else {
-		return fmt.Errorf("unable to start machine controller: API GroupVersion %q or %q or %q or %q or %q or %q is not available; found %#v", awsGVR, azureGVR, gcpGVR, openStackGVR, alicloudGVR, packetGVR, availableResources)
+		return fmt.Errorf("unable to start machine controller: API GroupVersion %q or %q or %q is not available; \nFound: %#v", machineGVR, machineSetGVR, machineDeploymentGVR, availableResources)
 	}
 
 	select {}
@@ -298,14 +306,14 @@ func getAvailableResources(clientBuilder corecontroller.ClientBuilder) (map[sche
 	err := wait.PollImmediate(time.Second, 10*time.Second, func() (bool, error) {
 		client, err := clientBuilder.Client("controller-discovery")
 		if err != nil {
-			glog.Errorf("Failed to get api versions from server: %v", err)
+			klog.Errorf("Failed to get api versions from server: %v", err)
 			return false, nil
 		}
 
 		healthStatus := 0
 		resp := client.Discovery().RESTClient().Get().AbsPath("/healthz").Do().StatusCode(&healthStatus)
 		if healthStatus != http.StatusOK {
-			glog.Errorf("Server isn't healthy yet.  Waiting a little while.")
+			klog.Errorf("Server isn't healthy yet.  Waiting a little while.")
 			return false, nil
 		}
 		content, _ := resp.Raw()
@@ -343,7 +351,7 @@ func getAvailableResources(clientBuilder corecontroller.ClientBuilder) (map[sche
 func createRecorder(kubeClient *kubernetes.Clientset) record.EventRecorder {
 	machinescheme.AddToScheme(kubescheme.Scheme)
 	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(glog.Infof)
+	eventBroadcaster.StartLogging(klog.Infof)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.CoreV1().RESTClient()).Events("")})
 	return eventBroadcaster.NewRecorder(kubescheme.Scheme, v1.EventSource{Component: controllerManagerAgentName})
 }
@@ -361,11 +369,12 @@ func startHTTP(s *options.MCMServer) {
 	}
 	configz.InstallHandler(mux)
 	mux.Handle("/metrics", prometheus.Handler())
+	handlers.UpdateHealth(true)
 	mux.HandleFunc("/healthz", handlers.Healthz)
 
 	server := &http.Server{
 		Addr:    net.JoinHostPort(s.Address, strconv.Itoa(int(s.Port))),
 		Handler: mux,
 	}
-	glog.Fatal(server.ListenAndServe())
+	klog.Fatal(server.ListenAndServe())
 }

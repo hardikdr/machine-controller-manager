@@ -30,7 +30,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
 	"github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
 	v1alpha1client "github.com/gardener/machine-controller-manager/pkg/client/clientset/versioned/typed/machine/v1alpha1"
@@ -45,7 +45,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/errors"
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/integer"
+	"k8s.io/utils/integer"
 
 	v1alpha1listers "github.com/gardener/machine-controller-manager/pkg/client/listers/machine/v1alpha1"
 )
@@ -109,6 +109,14 @@ const (
 	// PreferNoScheduleKey is used to identify machineSet nodes on which PreferNoSchedule taint is added on
 	// older machineSets during a rolling update
 	PreferNoScheduleKey = "deployment.machine.sapcloud.io/prefer-no-schedule"
+	// ClusterAutoscalerScaleDownDisabledAnnotationKey annotation to disable the scale-down of the nodes.
+	ClusterAutoscalerScaleDownDisabledAnnotationKey = "cluster-autoscaler.kubernetes.io/scale-down-disabled"
+	// ClusterAutoscalerScaleDownDisabledAnnotationValue annotation to disable the scale-down of the nodes.
+	ClusterAutoscalerScaleDownDisabledAnnotationValue = "True"
+	// ClusterAutoscalerScaleDownDisabledAnnotationByMCMKey annotation to disable the scale-down of the nodes.
+	ClusterAutoscalerScaleDownDisabledAnnotationByMCMKey = "cluster-autoscaler.kubernetes.io/scale-down-disabled-by-mcm"
+	// ClusterAutoscalerScaleDownDisabledAnnotationByMCMValue annotation to disable the scale-down of the nodes.
+	ClusterAutoscalerScaleDownDisabledAnnotationByMCMValue = "True"
 
 	// RollbackRevisionNotFound is not found rollback event reason
 	RollbackRevisionNotFound = "DeploymentRollbackRevisionNotFound"
@@ -249,7 +257,7 @@ func MaxRevision(allISs []*v1alpha1.MachineSet) int64 {
 	for _, is := range allISs {
 		if v, err := Revision(is); err != nil {
 			// Skip the machine sets when it failed to parse their revision information
-			glog.V(4).Infof("Error: %v. Couldn't parse revision for machine set %#v, machine deployment controller will skip it when reconciling revisions.", err, is)
+			klog.V(4).Infof("Error: %v. Couldn't parse revision for machine set %#v, machine deployment controller will skip it when reconciling revisions.", err, is)
 		} else if v > max {
 			max = v
 		}
@@ -263,7 +271,7 @@ func LastRevision(allISs []*v1alpha1.MachineSet) int64 {
 	for _, is := range allISs {
 		if v, err := Revision(is); err != nil {
 			// Skip the machine sets when it failed to parse their revision information
-			glog.V(4).Infof("Error: %v. Couldn't parse revision for machine set %#v, machine deployment controller will skip it when reconciling revisions.", err, is)
+			klog.V(4).Infof("Error: %v. Couldn't parse revision for machine set %#v, machine deployment controller will skip it when reconciling revisions.", err, is)
 		} else if v >= max {
 			secMax = max
 			max = v
@@ -304,7 +312,7 @@ func SetNewMachineSetAnnotations(deployment *v1alpha1.MachineDeployment, newIS *
 	oldRevisionInt, err := strconv.ParseInt(oldRevision, 10, 64)
 	if err != nil {
 		if oldRevision != "" {
-			glog.Warningf("Updating machine set revision OldRevision not int %s", err)
+			klog.Warningf("Updating machine set revision OldRevision not int %s", err)
 			return false
 		}
 		//If the RS annotation is empty then initialise it to 0
@@ -312,13 +320,13 @@ func SetNewMachineSetAnnotations(deployment *v1alpha1.MachineDeployment, newIS *
 	}
 	newRevisionInt, err := strconv.ParseInt(newRevision, 10, 64)
 	if err != nil {
-		glog.Warningf("Updating machine set revision NewRevision not int %s", err)
+		klog.Warningf("Updating machine set revision NewRevision not int %s", err)
 		return false
 	}
 	if oldRevisionInt < newRevisionInt {
 		newIS.Annotations[RevisionAnnotation] = newRevision
 		annotationChanged = true
-		glog.V(4).Infof("Updating machine set %q revision to %s", newIS.Name, newRevision)
+		klog.V(4).Infof("Updating machine set %q revision to %s", newIS.Name, newRevision)
 	}
 	// If a revision annotation already existed and this machine set was updated with a new revision
 	// then that means we are rolling back to this machine set. We need to preserve the old revisions
@@ -340,14 +348,121 @@ func SetNewMachineSetAnnotations(deployment *v1alpha1.MachineDeployment, newIS *
 	return annotationChanged
 }
 
+// SetNewMachineSetNodeTemplate sets new machine set's nodeTemplates appropriately by updating its revision and
+// copying required deployment nodeTemplates to it; it returns true if machine set's nodeTemplate is changed.
+func SetNewMachineSetNodeTemplate(deployment *v1alpha1.MachineDeployment, newIS *v1alpha1.MachineSet, newRevision string, exists bool) bool {
+	// First, copy deployment's nodeTemplate
+	nodeTemplateChanged := copyMachineDeploymentNodeTemplatesToMachineSet(deployment, newIS)
+	// Then, update machine set's revision annotation
+	if newIS.Annotations == nil {
+		newIS.Annotations = make(map[string]string)
+	}
+	oldRevision, ok := newIS.Annotations[RevisionAnnotation]
+
+	oldRevisionInt, err := strconv.ParseInt(oldRevision, 10, 64)
+	if err != nil {
+		if oldRevision != "" {
+			klog.Warningf("Updating machine set revision OldRevision not int %s", err)
+			return false
+		}
+		//If the RS annotation is empty then initialise it to 0
+		oldRevisionInt = 0
+	}
+	newRevisionInt, err := strconv.ParseInt(newRevision, 10, 64)
+	if err != nil {
+		klog.Warningf("Updating machine set revision NewRevision not int %s", err)
+		return false
+	}
+	if oldRevisionInt < newRevisionInt {
+		newIS.Annotations[RevisionAnnotation] = newRevision
+		nodeTemplateChanged = true
+		klog.V(4).Infof("Updating machine set %q revision to %s", newIS.Name, newRevision)
+	}
+	// If a revision annotation already existed and this machine set was updated with a new revision
+	// then that means we are rolling back to this machine set. We need to preserve the old revisions
+	// for historical information.
+	if ok && nodeTemplateChanged {
+		revisionHistoryAnnotation := newIS.Annotations[RevisionHistoryAnnotation]
+		oldRevisions := strings.Split(revisionHistoryAnnotation, ",")
+		if len(oldRevisions[0]) == 0 {
+			newIS.Annotations[RevisionHistoryAnnotation] = oldRevision
+		} else {
+			oldRevisions = append(oldRevisions, oldRevision)
+			newIS.Annotations[RevisionHistoryAnnotation] = strings.Join(oldRevisions, ",")
+		}
+	}
+	// If the new machine set is about to be created, we need to add replica annotations to it.
+	if !exists && SetReplicasAnnotations(newIS, (deployment.Spec.Replicas), (deployment.Spec.Replicas)+MaxSurge(*deployment)) {
+		nodeTemplateChanged = true
+	}
+	return nodeTemplateChanged
+}
+
+// SetNewMachineSetConfig sets new machine set's config appropriately by updating its revision and
+// copying required deployment nodeTemplates to it; it returns true if machine set's config is changed.
+func SetNewMachineSetConfig(deployment *v1alpha1.MachineDeployment, newIS *v1alpha1.MachineSet, newRevision string, exists bool) bool {
+	// First, copy deployment's config
+	configChanged := copyMachineDeploymentConfigToMachineSet(deployment, newIS)
+	// Then, update machine set's revision annotation
+	if newIS.Annotations == nil {
+		newIS.Annotations = make(map[string]string)
+	}
+	oldRevision, ok := newIS.Annotations[RevisionAnnotation]
+
+	oldRevisionInt, err := strconv.ParseInt(oldRevision, 10, 64)
+	if err != nil {
+		if oldRevision != "" {
+			klog.Warningf("Updating machine set revision OldRevision not int %s", err)
+			return false
+		}
+		//If the RS annotation is empty then initialise it to 0
+		oldRevisionInt = 0
+	}
+	newRevisionInt, err := strconv.ParseInt(newRevision, 10, 64)
+	if err != nil {
+		klog.Warningf("Updating machine set revision NewRevision not int %s", err)
+		return false
+	}
+	if oldRevisionInt < newRevisionInt {
+		newIS.Annotations[RevisionAnnotation] = newRevision
+		configChanged = true
+		klog.V(4).Infof("Updating machine set %q revision to %s", newIS.Name, newRevision)
+	}
+	// If a revision annotation already existed and this machine set was updated with a new revision
+	// then that means we are rolling back to this machine set. We need to preserve the old revisions
+	// for historical information.
+	if ok && configChanged {
+		revisionHistoryAnnotation := newIS.Annotations[RevisionHistoryAnnotation]
+		oldRevisions := strings.Split(revisionHistoryAnnotation, ",")
+		if len(oldRevisions[0]) == 0 {
+			newIS.Annotations[RevisionHistoryAnnotation] = oldRevision
+		} else {
+			oldRevisions = append(oldRevisions, oldRevision)
+			newIS.Annotations[RevisionHistoryAnnotation] = strings.Join(oldRevisions, ",")
+		}
+	}
+	// If the new machine set is about to be created, we need to add replica annotations to it.
+	if !exists && SetReplicasAnnotations(newIS, (deployment.Spec.Replicas), (deployment.Spec.Replicas)+MaxSurge(*deployment)) {
+		configChanged = true
+	}
+	return configChanged
+}
+
+// UpdateMachineSetClassKind updates class.Kind appropriately by updating its revision and
+// copying required deployment class.Kind to it; it returns true if machine set's class.Kind is changed.
+func UpdateMachineSetClassKind(deployment *v1alpha1.MachineDeployment, newIS *v1alpha1.MachineSet, newRevision string, exists bool) bool {
+	classKindChanged := copyMachineDeploymentClassKindToMachineSet(deployment, newIS)
+	return classKindChanged
+}
+
 var annotationsToSkip = map[string]bool{
 	v1.LastAppliedConfigAnnotation: true,
 	RevisionAnnotation:             true,
 	RevisionHistoryAnnotation:      true,
 	DesiredReplicasAnnotation:      true,
 	MaxReplicasAnnotation:          true,
-	LastReplicaUpdate:              true,
 	PreferNoScheduleKey:            true,
+	UnfreezeAnnotation:             true,
 }
 
 // skipCopyAnnotation returns true if we should skip copying the annotation with the given annotation key
@@ -376,6 +491,47 @@ func copyMachineDeploymentAnnotationsToMachineSet(deployment *v1alpha1.MachineDe
 		isAnnotationsChanged = true
 	}
 	return isAnnotationsChanged
+}
+
+// copyDeploymentNodetemplateToMachineSet copies deployment's nodeTemplate to machine set's nodeTemplate,
+// and returns true if machine set's nodeTemplate is changed.
+// Note that apply and revision nodeTemplates are not copied.
+func copyMachineDeploymentNodeTemplatesToMachineSet(deployment *v1alpha1.MachineDeployment, is *v1alpha1.MachineSet) bool {
+	isNodeTemplateChanged := !(apiequality.Semantic.DeepEqual(deployment.Spec.Template.Spec.NodeTemplateSpec, is.Spec.Template.Spec.NodeTemplateSpec))
+
+	if isNodeTemplateChanged {
+		klog.V(2).Infof("Observed a change in NodeTemplate of Machine Deployment %s. Changing NodeTemplate from %+v to \n %+v.", deployment.Name, is.Spec.Template.Spec.NodeTemplateSpec, deployment.Spec.Template.Spec.NodeTemplateSpec)
+		is.Spec.Template.Spec.NodeTemplateSpec = *deployment.Spec.Template.Spec.NodeTemplateSpec.DeepCopy()
+	}
+	return isNodeTemplateChanged
+}
+
+// copyDeploymentConfigurationToMachineSet copies deployment's configuration to machine set's configuration,
+// and returns true if machine set's configuration is changed.
+// Note that apply and revision configuration are not copied.
+func copyMachineDeploymentConfigToMachineSet(deployment *v1alpha1.MachineDeployment, is *v1alpha1.MachineSet) bool {
+
+	isConfigChanged := !(apiequality.Semantic.DeepEqual(deployment.Spec.Template.Spec.MachineConfiguration, is.Spec.Template.Spec.MachineConfiguration))
+
+	if isConfigChanged {
+		klog.V(2).Infof("Observed a change in Config of Machine Deployment %s. Changing Config from %+v to \n %+v.", deployment.Name, is.Spec.Template.Spec.MachineConfiguration, deployment.Spec.Template.Spec.MachineConfiguration)
+
+		is.Spec.Template.Spec.MachineConfiguration = deployment.Spec.Template.Spec.MachineConfiguration.DeepCopy()
+	}
+	return isConfigChanged
+}
+
+// copyMachineDeploymentClassKindToMachineSet copies machine deployment's
+// class.Kind to machine set's class.Kind, and returns true if machine set's
+// class.Kind is changed. Note that apply and revision nodeTemplates are not copied.
+func copyMachineDeploymentClassKindToMachineSet(deployment *v1alpha1.MachineDeployment, is *v1alpha1.MachineSet) bool {
+	if deployment.Spec.Template.Spec.Class.Kind != is.Spec.Template.Spec.Class.Kind {
+		klog.V(2).Infof("Observed a change in classKind of Machine Deployment %s. Changing classKind from %+v to %+v.", deployment.Name, is.Spec.Template.Spec.Class.Kind, deployment.Spec.Template.Spec.Class.Kind)
+		is.Spec.Template.Spec.Class.Kind = deployment.Spec.Template.Spec.Class.Kind
+		return true
+	}
+
+	return false
 }
 
 // SetMachineDeploymentAnnotationsTo sets deployment's annotations as given RS's annotations.
@@ -440,7 +596,7 @@ func getIntFromAnnotation(is *v1alpha1.MachineSet, annotationKey string) (int32,
 	}
 	intValue, err := strconv.Atoi(annotationValue)
 	if err != nil {
-		glog.V(2).Infof("Cannot convert the value %q with annotation key %q for the machine set %q", annotationValue, annotationKey, is.Name)
+		klog.V(2).Infof("Cannot convert the value %q with annotation key %q for the machine set %q", annotationValue, annotationKey, is.Name)
 		return int32(0), false
 	}
 	return int32(intValue), true
@@ -696,8 +852,12 @@ func EqualIgnoreHash(template1, template2 *v1alpha1.MachineTemplateSpec) bool {
 			return false
 		}
 	}
-	// Then, compare the templates without comparing their labels
+	// Then, compare the templates without comparing their labels, nodeTemplates and machine-configuration.
+	// We also ignore their labels, nodeTemplates & class.Kind while comparing.
 	t1Copy.Labels, t2Copy.Labels = nil, nil
+	t1Copy.Spec.NodeTemplateSpec, t2Copy.Spec.NodeTemplateSpec = v1alpha1.NodeTemplateSpec{}, v1alpha1.NodeTemplateSpec{}
+	t1Copy.Spec.MachineConfiguration, t2Copy.Spec.MachineConfiguration = nil, nil
+	t1Copy.Spec.Class.Kind, t2Copy.Spec.Class.Kind = "", ""
 	return apiequality.Semantic.DeepEqual(t1Copy, t2Copy)
 }
 
@@ -780,7 +940,7 @@ func LabelMachinesWithHash(machineList *v1alpha1.MachineList, c v1alpha1client.M
 			if err != nil {
 				return fmt.Errorf("error in adding template hash label %s to machine %q: %v", hash, machine.Name, err)
 			}
-			glog.V(4).Infof("Labeled machine %s/%s of MachineSet %s/%s with hash %s.", machine.Namespace, machine.Name, namespace, name, hash)
+			klog.V(4).Infof("Labeled machine %s/%s of MachineSet %s/%s with hash %s.", machine.Namespace, machine.Name, namespace, name, hash)
 		}
 	}
 	return nil
@@ -915,7 +1075,7 @@ func MachineDeploymentTimedOut(deployment *v1alpha1.MachineDeployment, newStatus
 	delta := time.Duration(*deployment.Spec.ProgressDeadlineSeconds) * time.Second
 	timedOut := from.Add(delta).Before(now)
 
-	glog.V(4).Infof("MachineDeployment %q timed out (%t) [last progress check: %v - now: %v]", deployment.Name, timedOut, from, now)
+	klog.V(4).Infof("MachineDeployment %q timed out (%t) [last progress check: %v - now: %v]", deployment.Name, timedOut, from, now)
 	return timedOut
 }
 
