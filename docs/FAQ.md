@@ -54,10 +54,10 @@ A machine could be deleted by MCM, generally for 2 reasons.
 
 1. Machine has been unhealthy for at least `MachineHealthTimeout` period, default is 10 minutes.
 
-   * Machine is considered unhealthy if any of the following node-conditions `DiskPressure,KernelDeadlock,FileSystemReadonly` are set to true, or `KubeletReady` is set to false.
+   * By default the machine is considered unhealthy if any of the following node-conditions `DiskPressure, KernelDeadlock, FileSystem, Readonly` is set to true, or `KubeletReady` is set to false. However, this is something that is configurable using the following [flag](https://github.com/gardener/machine-controller-manager/blob/rel-v0.34.0/kubernetes/deployment/out-of-tree/deployment.yaml#L30).
 2. Machine has been scale-down by the MachineDeployment resource.
 
-   * This is very usual if cluster-autoscaler(aka CA) is being used with MCM. CA deletes the under-utilized machines by scaling down the MachineDeployment. Read more about cluster-autoscaler's scale-down behavior [here](https://github.com/gardener/autoscaler/blob/machine-controller-manager-provider/cluster-autoscaler/FAQ.md#how-does-scale-down-work).
+   * This is very usual when an external controller cluster-autoscaler(aka CA) is being used with MCM. CA deletes the under-utilized machines by scaling down the MachineDeployment. Read more about cluster-autoscaler's scale-down behavior [here](https://github.com/gardener/autoscaler/blob/machine-controller-manager-provider/cluster-autoscaler/FAQ.md#how-does-scale-down-work).
 
 ### What are different sub-controllers in MCM ?
 
@@ -202,7 +202,7 @@ It could possibly be debugged with following steps:
 
 You can locally setup the MCM using following [guide](https://github.com/gardener/machine-controller-manager/blob/master/docs/development/local_setup.md). You must also enhance the unit-tests related to your changes. You can locally run the unit-test by executing:
 ```
-ginkgo --cover pkg/controller/.
+make test-unit
 ```
 
 ### I need to change the APIs, what are the recommended steps?
