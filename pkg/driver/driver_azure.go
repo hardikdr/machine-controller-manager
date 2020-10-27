@@ -26,12 +26,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gardener/machine-controller-manager/pkg/apis/machine"
 	v1alpha1 "github.com/gardener/machine-controller-manager/pkg/apis/machine/v1alpha1"
 	"github.com/gardener/machine-controller-manager/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-07-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-12-01/compute"
 	"github.com/Azure/azure-sdk-for-go/services/marketplaceordering/mgmt/2015-06-01/marketplaceordering"
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2019-11-01/network"
 	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2019-05-01/resources"
@@ -41,6 +42,11 @@ import (
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
 	"k8s.io/klog"
+)
+
+const (
+	// azureDiskDriverName is the name of the CSI driver for Azure Disk
+	azureDiskDriverName = "disk.csi.azure.com"
 )
 
 // AzureDriver is the driver struct for holding azure machine information
@@ -89,7 +95,6 @@ func (d *AzureDriver) getNICParameters(vmName string, subnet *network.Subnet) ne
 }
 
 func (d *AzureDriver) getVMParameters(vmName string, image *compute.VirtualMachineImage, networkInterfaceReferenceID string) compute.VirtualMachine {
-
 	var (
 		diskName    = dependencyNameFromVMName(vmName, diskSuffix)
 		UserDataEnc = base64.StdEncoding.EncodeToString([]byte(d.UserData))
@@ -172,9 +177,25 @@ func (d *AzureDriver) getVMParameters(vmName string, image *compute.VirtualMachi
 
 	if d.AzureMachineClass.Spec.Properties.Zone != nil {
 		VMParameters.Zones = &[]string{strconv.Itoa(*d.AzureMachineClass.Spec.Properties.Zone)}
-	} else if d.AzureMachineClass.Spec.Properties.AvailabilitySet != nil {
+	}
+
+	// DEPRECATED: This will be removed in future in favour of the machineSet field which has a type for AvailabilitySet.
+	if d.AzureMachineClass.Spec.Properties.AvailabilitySet != nil {
 		VMParameters.VirtualMachineProperties.AvailabilitySet = &compute.SubResource{
 			ID: &d.AzureMachineClass.Spec.Properties.AvailabilitySet.ID,
+		}
+	}
+
+	if d.AzureMachineClass.Spec.Properties.MachineSet != nil {
+		switch d.AzureMachineClass.Spec.Properties.MachineSet.Kind {
+		case machine.MachineSetKindVMO:
+			VMParameters.VirtualMachineProperties.VirtualMachineScaleSet = &compute.SubResource{
+				ID: &d.AzureMachineClass.Spec.Properties.MachineSet.ID,
+			}
+		case machine.MachineSetKindAvailabilitySet:
+			VMParameters.VirtualMachineProperties.AvailabilitySet = &compute.SubResource{
+				ID: &d.AzureMachineClass.Spec.Properties.MachineSet.ID,
+			}
 		}
 	}
 
@@ -713,6 +734,11 @@ func (clients *azureDriverClients) getRelevantVMs(ctx context.Context, machineID
 
 	if len(machines) > 0 {
 		for _, server := range machines {
+			if !verifyAzureTags(server.Tags, searchClusterName, searchNodeRole) {
+				klog.V(2).Infof("%q VM found, but not verified with tags %s and %s", *server.Name, searchClusterName, searchNodeRole)
+				continue
+			}
+
 			instanceID := encodeMachineID(location, *server.Name)
 
 			if machineID == "" {
@@ -759,6 +785,12 @@ func (clients *azureDriverClients) getRelevantNICs(ctx context.Context, machineI
 			if !isNic {
 				continue
 			}
+
+			if !verifyAzureTags(nic.Tags, searchClusterName, searchNodeRole) {
+				klog.V(2).Infof("%q NIC found, but not verified with tags %s and %s", *nic.Name, searchClusterName, searchNodeRole)
+				continue
+			}
+
 			instanceID := encodeMachineID(location, machineName)
 
 			if machineID == "" {
@@ -809,6 +841,12 @@ func (clients *azureDriverClients) getRelevantDisks(ctx context.Context, machine
 				if !isDisk {
 					continue
 				}
+
+				if !verifyAzureTags(disk.Tags, searchClusterName, searchNodeRole) {
+					klog.V(2).Infof("%q Disk found, but not verified with tags %s and %s", *disk.Name, searchClusterName, searchNodeRole)
+					continue
+				}
+
 				instanceID := encodeMachineID(location, machineName)
 
 				if machineID == "" {
@@ -1165,12 +1203,13 @@ func (d *AzureDriver) GetVolNames(specs []corev1.PersistentVolumeSpec) ([]string
 	names := []string{}
 	for i := range specs {
 		spec := &specs[i]
-		if spec.AzureDisk == nil {
-			// Not an azure volume
-			continue
+		if spec.AzureDisk != nil {
+			name := spec.AzureDisk.DiskName
+			names = append(names, name)
+		} else if spec.CSI != nil && spec.CSI.Driver == azureDiskDriverName && spec.CSI.VolumeHandle != "" {
+			name := spec.CSI.VolumeHandle
+			names = append(names, name)
 		}
-		name := spec.AzureDisk.DiskName
-		names = append(names, name)
 	}
 	return names, nil
 }
@@ -1188,4 +1227,25 @@ func retry(fn func() error, retries int, delay time.Duration) error {
 		}
 		time.Sleep(delay)
 	}
+}
+
+func verifyAzureTags(tags map[string]*string, clusterNameTag, nodeRoleTag string) bool {
+	if tags == nil {
+		return false
+	}
+
+	var clusterNameMatched, nodeRoleMatched bool
+	for key := range tags {
+		if strings.Contains(key, clusterNameTag) {
+			clusterNameMatched = true
+		}
+		if strings.Contains(key, nodeRoleTag) {
+			nodeRoleMatched = true
+		}
+	}
+	if !clusterNameMatched || !nodeRoleMatched {
+		return false
+	}
+
+	return true
 }

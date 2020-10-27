@@ -255,8 +255,9 @@ func (dc *controller) getNewMachineSet(d *v1alpha1.MachineDeployment, isList, ol
 		minReadySecondsNeedsUpdate := isCopy.Spec.MinReadySeconds != d.Spec.MinReadySeconds
 		nodeTemplateUpdated := SetNewMachineSetNodeTemplate(d, isCopy, newRevision, true)
 		machineConfigUpdated := SetNewMachineSetConfig(d, isCopy, newRevision, true)
+		updateMachineSetClassKind := UpdateMachineSetClassKind(d, isCopy, newRevision, true)
 
-		if annotationsUpdated || minReadySecondsNeedsUpdate || nodeTemplateUpdated || machineConfigUpdated {
+		if annotationsUpdated || minReadySecondsNeedsUpdate || nodeTemplateUpdated || machineConfigUpdated || updateMachineSetClassKind {
 			isCopy.Spec.MinReadySeconds = d.Spec.MinReadySeconds
 			return dc.controlMachineClient.MachineSets(isCopy.Namespace).Update(isCopy)
 		}
@@ -304,7 +305,7 @@ func (dc *controller) getNewMachineSet(d *v1alpha1.MachineDeployment, isList, ol
 	newIS := v1alpha1.MachineSet{
 		ObjectMeta: metav1.ObjectMeta{
 			// Make the name deterministic, to ensure idempotence
-			Name:            d.Name + "-" + rand.SafeEncodeString(machineTemplateSpecHash),
+			Name:            d.Name + "-" + rand.SafeEncodeString(machineTemplateSpecHash)[:5],
 			Namespace:       d.Namespace,
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(d, controllerKind)},
 			Labels:          newISTemplate.Labels,

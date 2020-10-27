@@ -36,12 +36,18 @@ import (
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/bootfromvolume"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/keypairs"
+	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/schedulerhints"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/images"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/ports"
 	"github.com/gophercloud/gophercloud/pagination"
 	"github.com/gophercloud/utils/client"
 	"github.com/gophercloud/utils/openstack/clientconfig"
+)
+
+const (
+	// CinderDriverName is the name of the CSI driver for Cinder
+	cinderDriverName = "cinder.csi.openstack.org"
 )
 
 type logger struct{}
@@ -177,6 +183,17 @@ func (d *OpenStackDriver) Create() (string, string, error) {
 		CreateOptsBuilder: createOpts,
 		KeyName:           keyName,
 	}
+
+	if d.OpenStackMachineClass.Spec.ServerGroupID != nil {
+		hints := schedulerhints.SchedulerHints{
+			Group: *d.OpenStackMachineClass.Spec.ServerGroupID,
+		}
+		createOpts = schedulerhints.CreateOptsExt{
+			CreateOptsBuilder: createOpts,
+			SchedulerHints:    hints,
+		}
+	}
+
 
 	if rootDiskSize > 0 {
 		blockDevices, err := resourceInstanceBlockDevicesV2(rootDiskSize, imageRef)
@@ -537,12 +554,13 @@ func (d *OpenStackDriver) GetVolNames(specs []corev1.PersistentVolumeSpec) ([]st
 	names := []string{}
 	for i := range specs {
 		spec := &specs[i]
-		if spec.Cinder == nil {
-			// Not a openStack volume
-			continue
+		if spec.Cinder != nil {
+			name := spec.Cinder.VolumeID
+			names = append(names, name)
+		} else if spec.CSI != nil && spec.CSI.Driver == cinderDriverName && spec.CSI.VolumeHandle != "" {
+			name := spec.CSI.VolumeHandle
+			names = append(names, name)
 		}
-		name := spec.Cinder.VolumeID
-		names = append(names, name)
 	}
 	return names, nil
 }

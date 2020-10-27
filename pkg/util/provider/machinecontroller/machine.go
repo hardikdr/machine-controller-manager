@@ -59,25 +59,29 @@ func (c *controller) deleteMachine(obj interface{}) {
 	c.enqueueMachine(obj)
 }
 
-func (c *controller) enqueueMachine(obj interface{}) {
+// isToBeEnqueued returns true if the key is to be managed by this controller
+func (c *controller) isToBeEnqueued(obj interface{}) (bool, string) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
 		klog.Errorf("Couldn't get key for object %+v: %v", obj, err)
-		return
+		return false, ""
 	}
 
-	klog.V(4).Infof("Adding machine object to the queue %q", key)
-	c.machineQueue.Add(key)
+	return true, key
+}
+
+func (c *controller) enqueueMachine(obj interface{}) {
+	if toBeEnqueued, key := c.isToBeEnqueued(obj); toBeEnqueued {
+		klog.V(4).Infof("Adding machine object to the queue %q", key)
+		c.machineQueue.Add(key)
+	}
 }
 
 func (c *controller) enqueueMachineAfter(obj interface{}, after time.Duration) {
-	key, err := cache.MetaNamespaceKeyFunc(obj)
-	if err != nil {
-		return
+	if toBeEnqueued, key := c.isToBeEnqueued(obj); toBeEnqueued {
+		klog.V(4).Infof("Adding machine object to the queue %q after %s", key, after)
+		c.machineQueue.AddAfter(key, after)
 	}
-
-	klog.V(4).Infof("Adding machine object to the queue %q after %s", key, after)
-	c.machineQueue.AddAfter(key, after)
 }
 
 func (c *controller) reconcileClusterMachineKey(key string) error {
@@ -135,9 +139,10 @@ func (c *controller) reconcileClusterMachine(machine *v1alpha1.Machine) (machine
 		return machineutils.DoNotRetryOp, err
 	}
 
-	machineClass, secret, err := c.ValidateMachineClass(&machine.Spec.Class)
+	machineClass, secret, retry, err := c.ValidateMachineClass(&machine.Spec.Class)
 	if err != nil {
-		return machineutils.DoNotRetryOp, err
+		klog.Error(err)
+		return retry, err
 	}
 
 	/*
@@ -294,6 +299,14 @@ func (c *controller) triggerCreationFlow(createMachineRequest *driver.CreateMach
 		return retry, err
 	}
 
+	// we should avoid mutating Secret, since it goes all the way into the Informer's store
+	secretCopy := createMachineRequest.Secret.DeepCopy()
+	err = c.addBootstrapTokenToUserData(machine.Name, secretCopy)
+	if err != nil {
+		return machineutils.RetryOp, err
+	}
+	createMachineRequest.Secret = secretCopy
+
 	// Find out if VM exists on provider for this machine object
 	getMachineStatusResponse, err := c.driver.GetMachineStatus(context.TODO(), &driver.GetMachineStatusRequest{
 		Machine:      machine,
@@ -314,8 +327,6 @@ func (c *controller) triggerCreationFlow(createMachineRequest *driver.CreateMach
 			klog.Errorf("Error occurred while decoding machine error for machine %q: %s", machine.Name, err)
 			return machineutils.RetryOp, err
 		}
-
-		klog.Info(machineErr.Code())
 
 		// Decoding gRPC error code
 		switch machineErr.Code() {
