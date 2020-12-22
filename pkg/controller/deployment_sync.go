@@ -294,14 +294,14 @@ func (dc *controller) getNewMachineSet(d *v1alpha1.MachineDeployment, isList, ol
 		return nil, nil
 	}
 
-	// new ReplicaSet does not exist, create one.
+	// new MachineSet does not exist, create one.
 	newISTemplate := *d.Spec.Template.DeepCopy()
 	machineTemplateSpecHash := fmt.Sprintf("%d", ComputeHash(&newISTemplate, d.Status.CollisionCount))
 	newISTemplate.Labels = labelsutil.CloneAndAddLabel(d.Spec.Template.Labels, v1alpha1.DefaultMachineDeploymentUniqueLabelKey, machineTemplateSpecHash)
 	// Add machineTemplateHash label to selector.
 	newISSelector := labelsutil.CloneSelectorAndAddLabel(d.Spec.Selector, v1alpha1.DefaultMachineDeploymentUniqueLabelKey, machineTemplateSpecHash)
 
-	// Create new ReplicaSet
+	// Create new MachineSet
 	newIS := v1alpha1.MachineSet{
 		ObjectMeta: metav1.ObjectMeta{
 			// Make the name deterministic, to ensure idempotence
